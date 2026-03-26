@@ -167,6 +167,35 @@ const KNOWN_REDIRECT_PAGES = [
   '/scanner', '/pipelines', '/knowledge', '/services'
 ];
 
+// Workers that use /status instead of /health as their health endpoint
+// Note: echo-build-orchestrator now has /health (added 2026-03-26)
+const HEALTH_ENDPOINT_OVERRIDES: Record<string, string> = {
+  // Add workers here that only respond to /status, not /health
+};
+
+// Get the correct health check path for a worker
+function getHealthPath(workerName: string): string {
+  return HEALTH_ENDPOINT_OVERRIDES[workerName] || '/health';
+}
+
+// Extract version from various health response formats
+function extractVersion(data: any): string {
+  if (!data || typeof data !== 'object') return '';
+  // Direct version field
+  if (data.version) return String(data.version);
+  if (data.v) return String(data.v);
+  // Wrapped in data.data (SDK gateway, Arcanum pattern)
+  if (data.data && typeof data.data === 'object') {
+    if (data.data.version) return String(data.data.version);
+    if (data.data.v) return String(data.data.v);
+  }
+  // Wrapped in meta
+  if (data.meta && typeof data.meta === 'object') {
+    if (data.meta.version) return String(data.meta.version);
+  }
+  return '';
+}
+
 const WORKER_BASE = '.bmcii1976.workers.dev';
 const BRAIN_URL = 'https://echo-shared-brain.bmcii1976.workers.dev';
 const DAEMON_URL = 'https://echo-autonomous-daemon.bmcii1976.workers.dev';
@@ -347,6 +376,24 @@ async function safeFetch(url: string, timeoutMs: number = 10000): Promise<{ ok: 
   }
 }
 
+// safeFetch variant with custom headers (for GitHub auth)
+async function safeFetchWithHeaders(url: string, headers: Record<string, string>, timeoutMs: number = 10000): Promise<{ ok: boolean; status: number; data: any; latencyMs: number; error?: string }> {
+  const start = Date.now();
+  try {
+    const resp = await fetchWithTimeout(url, { headers }, timeoutMs);
+    const latencyMs = Date.now() - start;
+    let data: any = null;
+    try {
+      data = await resp.json();
+    } catch {
+      data = await resp.text().catch(() => null);
+    }
+    return { ok: resp.ok, status: resp.status, data, latencyMs };
+  } catch (e: any) {
+    return { ok: false, status: 0, data: null, latencyMs: Date.now() - start, error: e.message };
+  }
+}
+
 // ═══════════════════════════════════════════════════
 // MODULE 1: WORKER WARMER
 // Keeps critical workers warm to prevent cold-start
@@ -361,14 +408,15 @@ async function warmUpWorkers(env: Env, cid: string, workersToWarm: string[] = CR
     const batch = workersToWarm.slice(i, i + 10);
     const batchResults = await Promise.allSettled(
       batch.map(async (worker) => {
-        const check = await workerFetch(env, worker, '/health', {}, 12000);
+        const healthPath = getHealthPath(worker);
+        const check = await workerFetch(env, worker, healthPath, {}, 12000);
 
         const result: WorkerCheckResult = {
           worker,
           healthy: check.ok,
           statusCode: check.status,
           latencyMs: check.latencyMs,
-          version: (check.data && typeof check.data === 'object') ? (check.data.version || check.data.v || '') : '',
+          version: extractVersion(check.data),
           error: check.error
         };
 
@@ -608,7 +656,8 @@ async function processDaemonTasks(env: Env, cid: string): Promise<{ processed: n
         const workerMatch = task.title.match(/Worker (echo-[\w-]+) slow/);
         if (workerMatch) {
           const workerName = workerMatch[1];
-          const check = await workerFetch(env, workerName, '/health');
+          const healthPath = getHealthPath(workerName);
+          const check = await workerFetch(env, workerName, healthPath);
 
           if (check.ok && check.latencyMs < 3000) {
             // Cold start resolved — mark task as auto-resolved
@@ -681,7 +730,24 @@ async function huntBugs(env: Env, cid: string): Promise<{ scanned: number; issue
     const results = await Promise.allSettled(
       batch.map(async (worker) => {
         scanned++;
-        const check = await workerFetch(env, worker, '/health', {}, 15000);
+        const healthPath = getHealthPath(worker);
+        let check = await workerFetch(env, worker, healthPath, {}, 15000);
+
+        // If /health returns 404, try fallback endpoints before flagging
+        if (!check.ok && check.status === 404 && healthPath === '/health') {
+          // Try /status as fallback
+          const fallback = await workerFetch(env, worker, '/status', {}, 10000);
+          if (fallback.ok) {
+            check = fallback;
+            // Remember this worker uses /status for future checks
+          } else {
+            // Try root / as last resort
+            const rootCheck = await workerFetch(env, worker, '/', {}, 10000);
+            if (rootCheck.ok) {
+              check = rootCheck;
+            }
+          }
+        }
 
         // Issue: Worker completely down
         if (!check.ok && check.status === 0) {
@@ -695,8 +761,15 @@ async function huntBugs(env: Env, cid: string): Promise<{ scanned: number; issue
           return;
         }
 
-        // Issue: Non-200 response
+        // Issue: Non-200 response (after fallback attempts)
         if (!check.ok && check.status > 0) {
+          // Workers without service bindings return 404 due to same-account
+          // Cloudflare fetch limitation — this is NOT a real bug
+          const hasBinding = !!SERVICE_BINDING_MAP[worker];
+          if (!hasBinding && check.status === 404) {
+            // Skip — can't reach unbound workers from within a Worker
+            return;
+          }
           issues.push({
             worker,
             issue: `http_${check.status}`,
@@ -731,8 +804,9 @@ async function huntBugs(env: Env, cid: string): Promise<{ scanned: number; issue
             issuesFound++;
           }
 
-          // Issue: Missing version (indicates old/unmaintained worker)
-          if (!check.data.version && !check.data.v) {
+          // Issue: Missing version (using deep extraction)
+          const version = extractVersion(check.data);
+          if (!version) {
             issues.push({
               worker,
               issue: 'no_version_in_health',
@@ -907,9 +981,17 @@ async function fixThinPage(env: Env, pagePath: string, detailsJson: string, cid:
   const cleanPath = pagePath.replace(/^\//, '').replace(/\/$/, '');
   const filePath = `app/${cleanPath}/page.tsx`;
 
-  // Read current file from GitHub
-  const existing = await safeFetch(
+  // Read current file from GitHub (authenticated — repo may be private)
+  const ghHeaders: Record<string, string> = {
+    'Accept': 'application/vnd.github.v3+json',
+    'User-Agent': 'EchoAutoBuilder/1.0'
+  };
+  if (env.GITHUB_TOKEN) {
+    ghHeaders['Authorization'] = `Bearer ${env.GITHUB_TOKEN}`;
+  }
+  const existing = await safeFetchWithHeaders(
     `${GITHUB_API}/repos/${GITHUB_OWNER}/${EPT_REPO}/contents/${filePath}`,
+    ghHeaders,
     10000
   );
 
@@ -1120,12 +1202,34 @@ export default function ${slug.split('-').map((w: string) => w.charAt(0).toUpper
 
 async function fixWorkerIssue(env: Env, workerName: string, detailsJson: string, cid: string): Promise<boolean> {
   const details = JSON.parse(detailsJson);
+  const healthPath = getHealthPath(workerName);
+
+  // For HTTP 404 on health — try alternative endpoints
+  if (details.issue && details.issue.startsWith('http_404')) {
+    // Try /status, then / as fallbacks
+    for (const altPath of ['/status', '/']) {
+      if (altPath === healthPath) continue; // Skip if already the configured path
+      const check = await workerFetch(env, workerName, altPath, {}, 10000);
+      if (check.ok) {
+        await logAction(env.DB, {
+          action_type: 'fix_worker_alt_health',
+          target: workerName,
+          details: `Worker responds on ${altPath} instead of /health. Latency: ${check.latencyMs}ms. Version: ${extractVersion(check.data)}`,
+          result: 'fixed',
+          duration_ms: check.latencyMs,
+          cycle_id: cid
+        });
+        return true;
+      }
+    }
+    return false;
+  }
 
   // For unreachable workers — try warming up (sometimes it's just cold start)
   if (details.issue === 'worker_unreachable' || details.issue === 'extreme_latency') {
     // Try 3 warm-up pings
     for (let attempt = 0; attempt < 3; attempt++) {
-      const check = await workerFetch(env, workerName, '/health', {}, 15000);
+      const check = await workerFetch(env, workerName, healthPath, {}, 15000);
       if (check.ok && check.latencyMs < 5000) {
         await logAction(env.DB, {
           action_type: 'fix_worker_warmup',

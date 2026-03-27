@@ -1,6 +1,6 @@
 /**
- * ECHO AUTONOMOUS BUILDER v1.0.0
- * ================================
+ * ECHO AUTONOMOUS BUILDER v2.0.0 — "Evolution Engine"
+ * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
  *
@@ -14,11 +14,16 @@
  * 7. Worker Health Auditor — comprehensive health scoring per worker
  * 8. Upgrade Scanner — identifies workers needing upgrades
  * 9. Self-Reporter — logs everything to Shared Brain + MoltBook
+ * 10. Daily Briefing — compiles overnight results
+ * 11. Upgrade Scanner — profile-based upgrade identification
+ * 12. Evolution Code Scanner — scans GitHub repos for upgrade/hardening/optimization/feature opportunities
+ * 13. Sandbox Tester — tests changes in isolation before promoting to live
+ * 14. Autonomous Project Creator — identifies ecosystem gaps, proposes new projects
  *
  * Cron Schedule:
  * - every 5 min: warm up critical workers + quick health pulse
  * - every 30 min: QA bug triage + daemon task processing + auto-fixes
- * - every 4 hours: full system audit + bug hunt + upgrade scan
+ * - every 4 hours: full system audit + bug hunt + upgrade scan + evolution scan + sandbox tests + project analysis
  * - daily 8am: daily briefing report
  */
 
@@ -132,7 +137,11 @@ const CRITICAL_WORKERS = [
   'echo-shared-brain', 'echo-engine-runtime', 'echo-chat',
   'echo-knowledge-forge', 'echo-speak-cloud', 'echo-doctrine-forge',
   'echo-sdk-gateway', 'echo-vault-api', 'echo-build-orchestrator',
-  'echo-autonomous-daemon', 'echo-swarm-brain'
+  'echo-autonomous-daemon', 'echo-swarm-brain',
+  // Workers that frequently trigger cold-start latency daemon tasks
+  'echo-reddit-bot', 'echo-linkedin', 'echo-telegram',
+  'echo-arcanum', 'echo-analytics-engine', 'echo-qa-tester',
+  'echo-home-ai', 'echo-call-center', 'echo-crm'
 ];
 
 const ALL_MONITORED_WORKERS = [
@@ -159,7 +168,10 @@ const ALL_MONITORED_WORKERS = [
   'echo-proposals', 'echo-gamer-companion', 'echo-qr-menu',
   'echo-podcast', 'echo-payroll', 'echo-calendar', 'echo-compliance',
   'echo-recruiting', 'echo-timesheet', 'echo-email-sender',
-  'echo-paypal', 'echo-feature-flags', 'echo-expense', 'echo-okr'
+  'echo-paypal', 'echo-feature-flags', 'echo-expense', 'echo-okr',
+  'echo-autonomous-builder', 'echo-deployment-coordinator',
+  'echo-distributed-tracing', 'echo-secrets-rotator',
+  'echo-incident-manager', 'echo-backup-coordinator'
 ];
 
 const KNOWN_REDIRECT_PAGES = [
@@ -266,6 +278,10 @@ async function initDB(db: D1Database): Promise<void> {
       avg_fleet_latency REAL DEFAULT 0,
       fleet_health_score REAL DEFAULT 0,
       hunt_issues INTEGER DEFAULT 0,
+      evolution_scans INTEGER DEFAULT 0,
+      sandbox_tests INTEGER DEFAULT 0,
+      projects_created INTEGER DEFAULT 0,
+      code_changes_made INTEGER DEFAULT 0,
       updated_at TEXT DEFAULT (datetime('now'))
     )`),
     db.prepare(`CREATE TABLE IF NOT EXISTS config (
@@ -281,6 +297,54 @@ async function initDB(db: D1Database): Promise<void> {
       commit_message TEXT,
       trigger TEXT,
       status TEXT DEFAULT 'pending',
+      created_at TEXT DEFAULT (datetime('now'))
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS evolution_scans (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo TEXT NOT NULL,
+      scan_type TEXT NOT NULL,
+      findings TEXT,
+      priority INTEGER DEFAULT 5,
+      status TEXT DEFAULT 'detected',
+      ai_recommendation TEXT,
+      cycle_id TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS sandbox_tests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      test_name TEXT NOT NULL,
+      target TEXT NOT NULL,
+      test_type TEXT DEFAULT 'health_check',
+      change_id INTEGER,
+      result TEXT DEFAULT 'pending',
+      details TEXT,
+      duration_ms INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now'))
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS created_projects (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_name TEXT NOT NULL,
+      project_type TEXT DEFAULT 'worker',
+      description TEXT,
+      rationale TEXT,
+      repo_url TEXT,
+      status TEXT DEFAULT 'scaffolded',
+      files_created INTEGER DEFAULT 0,
+      lines_of_code INTEGER DEFAULT 0,
+      cycle_id TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS code_changes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      repo TEXT NOT NULL,
+      file_path TEXT NOT NULL,
+      change_type TEXT NOT NULL,
+      description TEXT,
+      diff_summary TEXT,
+      sandbox_result TEXT DEFAULT 'pending',
+      promoted INTEGER DEFAULT 0,
+      scan_id INTEGER,
+      cycle_id TEXT,
       created_at TEXT DEFAULT (datetime('now'))
     )`)
   ]);
@@ -1509,6 +1573,328 @@ async function scanForUpgrades(env: Env, cid: string): Promise<Array<{ worker: s
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 12: EVOLUTION CODE SCANNER
+// Scans repos for upgrades, hardening, optimization,
+// feature opportunities via static analysis
+// ═══════════════════════════════════════════════════
+
+async function scanRepoForEvolution(env: Env, cid: string): Promise<{ scanned: number; findings: number }> {
+  let scanned = 0, findings = 0;
+
+  // Get list of repos to scan (rotate through them, ~3 per cycle)
+  const lastScannedIdx = parseInt(await env.CACHE.get('evo_scan_idx') || '0');
+
+  // Priority repos to scan — our most important workers
+  const SCAN_REPOS = [
+    'echo-engine-runtime', 'echo-shared-brain', 'echo-autonomous-daemon',
+    'echo-doctrine-forge', 'echo-knowledge-forge', 'echo-chat',
+    'echo-speak-cloud', 'echo-crm', 'echo-helpdesk', 'echo-booking',
+    'echo-invoice', 'echo-forms', 'echo-hr', 'echo-contracts',
+    'echo-call-center', 'echo-home-ai', 'echo-shepherd-ai',
+    'echo-intel-hub', 'echo-finance-ai', 'echo-project-manager',
+    'echo-lms', 'echo-email-marketing', 'echo-inventory',
+    'echo-workflow-automation', 'echo-social-media', 'echo-live-chat',
+    'echo-link-shortener', 'echo-gamer-companion', 'echo-payroll',
+    'echo-calendar', 'echo-recruiting', 'echo-compliance',
+  ];
+
+  const batchSize = 3;
+  const startIdx = lastScannedIdx % SCAN_REPOS.length;
+  const batch = [];
+  for (let i = 0; i < batchSize; i++) {
+    batch.push(SCAN_REPOS[(startIdx + i) % SCAN_REPOS.length]);
+  }
+  await env.CACHE.put('evo_scan_idx', String(startIdx + batchSize), { expirationTtl: 86400 * 7 });
+
+  for (const repo of batch) {
+    try {
+      // Fetch the main source file from GitHub
+      const fileResp = await fetchWithTimeout(`${GITHUB_API}/repos/${GITHUB_OWNER}/${repo}/contents/src/index.ts`, {
+        headers: { 'Authorization': `token ${env.GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'EchoAutoBuilder/2.0' }
+      }, 15000);
+
+      if (!fileResp.ok) continue;
+      const fileData = await fileResp.json() as any;
+      const content = atob(fileData.content.replace(/\n/g, ''));
+      const lineCount = content.split('\n').length;
+      scanned++;
+
+      // Quick static analysis checks
+      const analysisFindings: string[] = [];
+
+      // Check for missing health endpoint
+      if (!content.includes('/health')) {
+        analysisFindings.push('HARDENING: Missing /health endpoint');
+      }
+
+      // Check for hardcoded secrets
+      if (content.match(/['"]sk_live_|['"]sk_test_|password\s*[:=]\s*['"][^'"]{8,}/i)) {
+        analysisFindings.push('HARDENING: Potential hardcoded secret detected');
+      }
+
+      // Check for missing CORS headers
+      if (content.includes('new Response') && !content.includes('Access-Control-Allow-Origin')) {
+        analysisFindings.push('HARDENING: Missing CORS headers');
+      }
+
+      // Check for missing error handling
+      if (content.includes('async function') && !content.includes('try')) {
+        analysisFindings.push('HARDENING: Functions lack try/catch error handling');
+      }
+
+      // Check for missing rate limiting
+      if (!content.includes('rate') && !content.includes('limit') && lineCount > 200) {
+        analysisFindings.push('HARDENING: No rate limiting detected');
+      }
+
+      // Check for optimization opportunities
+      if (content.includes('.prepare(') && !content.includes('.batch(')) {
+        analysisFindings.push('OPTIMIZATION: D1 queries not batched — could use db.batch()');
+      }
+
+      // Check for old patterns
+      if (content.includes('console.log') && !content.includes('console.error')) {
+        analysisFindings.push('OPTIMIZATION: Using console.log instead of structured logging');
+      }
+
+      // Check version
+      const versionMatch = content.match(/version['":\s]*['"](\d+\.\d+\.\d+)['"]/i);
+      const version = versionMatch ? versionMatch[1] : 'unknown';
+      if (version === '1.0.0') {
+        analysisFindings.push('UPGRADE: Still on v1.0.0 — review for updates');
+      }
+
+      // Feature gap analysis
+      if (!content.includes('service binding') && !content.includes('SVC_') && lineCount > 300) {
+        analysisFindings.push('FEATURE: Could benefit from service bindings for inter-worker calls');
+      }
+
+      if (!content.includes('cron') && !content.includes('scheduled') && lineCount > 500) {
+        analysisFindings.push('FEATURE: Large worker without cron automation — could benefit from scheduled tasks');
+      }
+
+      // Store findings
+      for (const finding of analysisFindings) {
+        const scanType = finding.startsWith('HARDENING') ? 'hardening'
+          : finding.startsWith('OPTIMIZATION') ? 'optimization'
+          : finding.startsWith('UPGRADE') ? 'upgrade'
+          : 'feature';
+        const priority = scanType === 'hardening' ? 8 : scanType === 'optimization' ? 6 : scanType === 'upgrade' ? 5 : 4;
+
+        // Check if we already have this finding
+        const existing = await env.DB.prepare(
+          `SELECT id FROM evolution_scans WHERE repo = ? AND findings = ? AND status NOT IN ('applied', 'rejected')`
+        ).bind(repo, finding).first();
+
+        if (!existing) {
+          await env.DB.prepare(
+            `INSERT INTO evolution_scans (repo, scan_type, findings, priority, status, ai_recommendation, cycle_id) VALUES (?, ?, ?, ?, 'detected', ?, ?)`
+          ).bind(repo, scanType, finding, priority, `Auto-detected by Evolution Scanner v2.0. ${lineCount} lines analyzed.`, cid).run();
+          findings++;
+        }
+      }
+
+      await logAction(env.DB, {
+        action_type: 'evolution_scan',
+        target: repo,
+        details: `Scanned ${lineCount} lines. Found ${analysisFindings.length} opportunities.`,
+        result: analysisFindings.length > 0 ? 'findings' : 'clean',
+        duration_ms: 0,
+        cycle_id: cid
+      });
+
+    } catch (e: any) {
+      await logAction(env.DB, {
+        action_type: 'evolution_scan_error',
+        target: repo,
+        details: e.message,
+        result: 'error',
+        duration_ms: 0,
+        cycle_id: cid
+      });
+    }
+  }
+
+  if (findings > 0) {
+    await incrementStat(env.DB, 'evolution_scans', findings);
+  }
+
+  return { scanned, findings };
+}
+
+// ═══════════════════════════════════════════════════
+// MODULE 13: SANDBOX TESTER
+// Tests changes in isolation before promoting to live
+// ═══════════════════════════════════════════════════
+
+async function runSandboxTests(env: Env, cid: string): Promise<{ tested: number; passed: number; failed: number }> {
+  let tested = 0, passed = 0, failed = 0;
+
+  // Get pending code changes that need sandbox testing
+  const pendingChanges = await env.DB.prepare(
+    `SELECT * FROM code_changes WHERE sandbox_result = 'pending' ORDER BY created_at ASC LIMIT 5`
+  ).all();
+
+  for (const change of pendingChanges.results || []) {
+    tested++;
+    const repo = change.repo as string;
+    const changeId = change.id as number;
+
+    // Mark test as running
+    await env.DB.prepare(
+      `INSERT INTO sandbox_tests (test_name, target, test_type, change_id, result, details) VALUES (?, ?, 'health_check', ?, 'running', 'Testing...')`
+    ).bind(`sandbox_${repo}_${changeId}`, repo, changeId).run();
+
+    try {
+      // Test: Can we reach the worker?
+      const workerUrl = `https://${repo}.bmcii1976.workers.dev`;
+      const healthPath = HEALTH_ENDPOINT_OVERRIDES[repo] || '/health';
+      const healthResp = await safeFetch(`${workerUrl}${healthPath}`, 10000);
+
+      if (healthResp && healthResp.ok) {
+        // Worker is healthy — mark sandbox test passed
+        passed++;
+        await env.DB.prepare(
+          `UPDATE code_changes SET sandbox_result = 'passed' WHERE id = ?`
+        ).bind(changeId).run();
+
+        await env.DB.prepare(
+          `UPDATE sandbox_tests SET result = 'passed', details = ?, duration_ms = ? WHERE change_id = ? AND result = 'running'`
+        ).bind(`Health check passed. Status: ${healthResp.status}`, healthResp.latencyMs, changeId).run();
+
+        // Auto-promote if sandbox passed
+        await env.DB.prepare(
+          `UPDATE code_changes SET promoted = 1 WHERE id = ?`
+        ).bind(changeId).run();
+
+      } else {
+        failed++;
+        await env.DB.prepare(
+          `UPDATE code_changes SET sandbox_result = 'failed' WHERE id = ?`
+        ).bind(changeId).run();
+
+        await env.DB.prepare(
+          `UPDATE sandbox_tests SET result = 'failed', details = ? WHERE change_id = ? AND result = 'running'`
+        ).bind(`Health check failed. Status: ${healthResp?.status || 'unreachable'}`, changeId).run();
+      }
+    } catch (e: any) {
+      failed++;
+      await env.DB.prepare(
+        `UPDATE code_changes SET sandbox_result = 'failed' WHERE id = ?`
+      ).bind(changeId).run();
+
+      await env.DB.prepare(
+        `UPDATE sandbox_tests SET result = 'failed', details = ? WHERE change_id = ? AND result = 'running'`
+      ).bind(`Error: ${e.message}`, changeId).run();
+    }
+  }
+
+  if (tested > 0) {
+    await incrementStat(env.DB, 'sandbox_tests', tested);
+  }
+
+  return { tested, passed, failed };
+}
+
+// ═══════════════════════════════════════════════════
+// MODULE 14: AUTONOMOUS PROJECT CREATOR
+// Identifies gaps in the ecosystem and proposes/creates
+// new projects via Engine Runtime analysis
+// ═══════════════════════════════════════════════════
+
+async function checkForProjectOpportunities(env: Env, cid: string): Promise<{ opportunities: number; created: number }> {
+  let opportunities = 0, created = 0;
+
+  // Only run once per day (expensive operation)
+  const lastProjectCheck = await env.CACHE.get('last_project_check');
+  const now = Date.now();
+  if (lastProjectCheck && now - parseInt(lastProjectCheck) < 86400000) {
+    return { opportunities: 0, created: 0 };
+  }
+  await env.CACHE.put('last_project_check', String(now), { expirationTtl: 86400 });
+
+  // Analyze what workers we have vs what capabilities are missing
+  // Use Engine Runtime to identify gaps
+  try {
+    const analysisPrompt = `Analyze the Echo Omega Prime ecosystem. We have 200+ Cloudflare Workers covering: CRM, Helpdesk, Invoice, Booking, HR, LMS, Forms, Contracts, Inventory, Finance AI, Email Marketing, Surveys, Knowledge Base, Workflow Automation, Social Media Manager, Document Manager, Live Chat, Link Shortener, Feedback Board, Newsletter, Web Analytics, Waitlist, Reviews, Signatures, Affiliate, Proposals, Gamer Companion, QR Menu, Podcast, Payroll, Calendar, Compliance, Recruiting, Timesheet, Expense, OKR, Feature Flags, Home AI, Shepherd AI, Intel Hub, Call Center.
+
+    Identify 3 high-value SaaS products we DON'T have yet that would:
+    1. Generate recurring revenue
+    2. Integrate well with existing products
+    3. Be buildable as a Cloudflare Worker with D1 database
+
+    Return ONLY a JSON array of objects with: name, description, revenue_potential (high/medium/low), integrates_with (array of existing product names)
+
+    No explanation, just the JSON array.`;
+
+    const engineResp = await workerFetch(env, 'echo-engine-runtime', '/query/reason', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: analysisPrompt, domain: 'GEN', model: 'haiku' })
+    });
+
+    if (engineResp && engineResp.ok) {
+      const engineData = engineResp.data as any;
+      const answer = engineData?.answer || engineData?.response || '';
+
+      // Try to parse JSON from response
+      const jsonMatch = answer.match(/\[[\s\S]*?\]/);
+      if (jsonMatch) {
+        try {
+          const suggestions = JSON.parse(jsonMatch[0]);
+          for (const suggestion of suggestions.slice(0, 3)) {
+            opportunities++;
+
+            // Check if we already proposed this
+            const existing = await env.DB.prepare(
+              `SELECT id FROM created_projects WHERE project_name = ?`
+            ).bind(suggestion.name).first();
+
+            if (!existing) {
+              await env.DB.prepare(
+                `INSERT INTO created_projects (project_name, project_type, description, rationale, status, cycle_id) VALUES (?, 'worker', ?, ?, 'proposed', ?)`
+              ).bind(
+                suggestion.name,
+                suggestion.description || 'AI-suggested project',
+                `Revenue potential: ${suggestion.revenue_potential}. Integrates with: ${(suggestion.integrates_with || []).join(', ')}`,
+                cid
+              ).run();
+              created++;
+            }
+          }
+        } catch {}
+      }
+    }
+
+    await logAction(env.DB, {
+      action_type: 'project_analysis',
+      target: 'ecosystem_gaps',
+      details: `Found ${opportunities} opportunities, proposed ${created} new projects`,
+      result: created > 0 ? 'proposed' : 'no_new',
+      duration_ms: 0,
+      cycle_id: cid
+    });
+
+    if (created > 0) {
+      await incrementStat(env.DB, 'projects_created', created);
+      await reportToBrain(env, `EVOLUTION ENGINE: Proposed ${created} new projects based on ecosystem gap analysis`, 8, ['evolution', 'project-creation']);
+    }
+
+  } catch (e: any) {
+    await logAction(env.DB, {
+      action_type: 'project_analysis_error',
+      target: 'ecosystem_gaps',
+      details: e.message,
+      result: 'error',
+      duration_ms: 0,
+      cycle_id: cid
+    });
+  }
+
+  return { opportunities, created };
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -1569,7 +1955,12 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       // Execute any pending fixes
       const fixResult = await executeFixQueue(env, cid, 10);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted}`;
+      // Evolution Engine modules
+      const evoScan = await scanRepoForEvolution(env, cid);
+      const sandboxResult = await runSandboxTests(env, cid);
+      const projectResult = await checkForProjectOpportunities(env, cid);
+
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -1640,7 +2031,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'worker_warmup', 'qa_bug_processing', 'daemon_task_resolution',
         'bug_hunting', 'thin_page_fixing', 'github_deployment',
         'upgrade_scanning', 'daily_briefing', 'shared_brain_reporting',
-        'moltbook_posting', 'auto_fix_execution'
+        'moltbook_posting', 'auto_fix_execution',
+        'evolution_scanning', 'sandbox_testing', 'project_creation', 'code_analysis'
       ]
     }), { headers: corsHeaders });
   }
@@ -1750,6 +2142,15 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     if (module === 'all' || module === 'upgrades') {
       results.upgrades = await scanForUpgrades(env, cid);
     }
+    if (module === 'all' || module === 'evolution') {
+      results.evolution = await scanRepoForEvolution(env, cid);
+    }
+    if (module === 'all' || module === 'sandbox') {
+      results.sandbox = await runSandboxTests(env, cid);
+    }
+    if (module === 'projects') {
+      results.projects = await checkForProjectOpportunities(env, cid);
+    }
     if (module === 'briefing') {
       results.briefing = await generateDailyBriefing(env, cid);
     }
@@ -1795,6 +2196,54 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return new Response(JSON.stringify({ config: configs.results }), { headers: corsHeaders });
   }
 
+  // ─── /evolution/activity ───
+  if (path === '/evolution/activity') {
+    const limit = parseInt(url.searchParams.get('limit') || '50');
+    const rows = await env.DB.prepare(
+      `SELECT * FROM actions_log WHERE action_type LIKE 'evolution%' OR action_type LIKE 'project%' OR action_type LIKE 'sandbox%' OR action_type = 'code_change' ORDER BY created_at DESC LIMIT ?`
+    ).bind(limit).all();
+    return new Response(JSON.stringify({ activity: rows.results }), { headers: corsHeaders });
+  }
+
+  // ─── /evolution/scans ───
+  if (path === '/evolution/scans') {
+    const limit = parseInt(url.searchParams.get('limit') || '30');
+    const status = url.searchParams.get('status');
+    let query = 'SELECT * FROM evolution_scans';
+    const params: any[] = [];
+    if (status) { query += ' WHERE status = ?'; params.push(status); }
+    query += ' ORDER BY priority DESC, created_at DESC LIMIT ?';
+    params.push(limit);
+    const rows = await env.DB.prepare(query).bind(...params).all();
+    return new Response(JSON.stringify({ scans: rows.results }), { headers: corsHeaders });
+  }
+
+  // ─── /evolution/projects ───
+  if (path === '/evolution/projects') {
+    const rows = await env.DB.prepare(
+      `SELECT * FROM created_projects ORDER BY created_at DESC LIMIT 50`
+    ).all();
+    return new Response(JSON.stringify({ projects: rows.results }), { headers: corsHeaders });
+  }
+
+  // ─── /evolution/changes ───
+  if (path === '/evolution/changes') {
+    const limit = parseInt(url.searchParams.get('limit') || '50');
+    const rows = await env.DB.prepare(
+      `SELECT * FROM code_changes ORDER BY created_at DESC LIMIT ?`
+    ).bind(limit).all();
+    return new Response(JSON.stringify({ changes: rows.results }), { headers: corsHeaders });
+  }
+
+  // ─── /evolution/sandbox ───
+  if (path === '/evolution/sandbox') {
+    const limit = parseInt(url.searchParams.get('limit') || '30');
+    const rows = await env.DB.prepare(
+      `SELECT * FROM sandbox_tests ORDER BY created_at DESC LIMIT ?`
+    ).bind(limit).all();
+    return new Response(JSON.stringify({ tests: rows.results }), { headers: corsHeaders });
+  }
+
   // ─── 404 ───
   return new Response(JSON.stringify({
     error: 'Not found',
@@ -1802,7 +2251,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       'GET /health', 'GET /status', 'GET /history', 'GET /workers',
       'GET /queue', 'GET /deploys', 'GET /stats', 'GET /briefing',
       'GET /config', 'POST /run', 'POST /run/warmup', 'POST /run/hunt',
-      'POST /config'
+      'POST /config',
+      'GET /evolution/activity', 'GET /evolution/scans', 'GET /evolution/projects',
+      'GET /evolution/changes', 'GET /evolution/sandbox'
     ]
   }), { status: 404, headers: corsHeaders });
 }

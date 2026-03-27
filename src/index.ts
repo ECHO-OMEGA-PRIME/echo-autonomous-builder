@@ -1895,6 +1895,246 @@ async function checkForProjectOpportunities(env: Env, cid: string): Promise<{ op
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 15: AUTO-FIXER
+// Takes detected evolution_scans findings and generates
+// intelligent code fixes, pushes them to GitHub
+// ═══════════════════════════════════════════════════
+
+async function executeEvolutionFixes(env: Env, cid: string): Promise<{ attempted: number; fixed: number; failed: number }> {
+  let attempted = 0, fixed = 0, failed = 0;
+
+  // Get detected findings that haven't been fixed yet (limit 3 per cycle to stay safe)
+  const detected = await env.DB.prepare(
+    `SELECT * FROM evolution_scans WHERE status = 'detected' ORDER BY priority DESC LIMIT 3`
+  ).all();
+
+  for (const scan of detected.results || []) {
+    const repo = scan.repo as string;
+    const finding = scan.findings as string;
+    const scanId = scan.id as number;
+    attempted++;
+
+    try {
+      // Mark as in_progress
+      await env.DB.prepare(`UPDATE evolution_scans SET status = 'in_progress' WHERE id = ?`).bind(scanId).run();
+
+      // Fetch the source from GitHub
+      const fileResp = await fetchWithTimeout(
+        `${GITHUB_API}/repos/${GITHUB_OWNER}/${repo}/contents/src/index.ts`,
+        { headers: { 'Authorization': `token ${env.GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'EchoAutoBuilder/2.0' } },
+        15000
+      );
+
+      if (!fileResp.ok) {
+        await env.DB.prepare(`UPDATE evolution_scans SET status = 'failed', ai_recommendation = ? WHERE id = ?`)
+          .bind(`Could not fetch source: HTTP ${fileResp.status}`, scanId).run();
+        failed++;
+        continue;
+      }
+
+      const fileData = await fileResp.json() as any;
+      const originalContent = decodeURIComponent(escape(atob(fileData.content.replace(/\n/g, ''))));
+      const fileSha = fileData.sha;
+      let modifiedContent = originalContent;
+      let fixDescription = '';
+
+      // ── OPTIMIZATION: D1 queries not batched ──
+      if (finding.includes('D1 queries not batched')) {
+        // Add a comment at top noting batch opportunity, don't rewrite queries (too risky autonomously)
+        if (!modifiedContent.includes('// TODO: Consider batching D1 queries')) {
+          const insertPoint = modifiedContent.indexOf('\n\n', modifiedContent.indexOf('interface Env'));
+          if (insertPoint > -1) {
+            modifiedContent = modifiedContent.slice(0, insertPoint) +
+              '\n\n// TODO: Consider batching sequential D1 queries with db.batch() for performance' +
+              modifiedContent.slice(insertPoint);
+            fixDescription = 'Added D1 batch optimization TODO marker';
+          }
+        }
+      }
+
+      // ── OPTIMIZATION: console.log → structured logging ──
+      if (finding.includes('console.log instead of structured logging')) {
+        // Replace console.log with structured JSON logging helper
+        const consoleLogCount = (modifiedContent.match(/console\.log\(/g) || []).length;
+        if (consoleLogCount > 0 && consoleLogCount <= 50) {
+          // Add structured log helper if not present
+          if (!modifiedContent.includes('function structuredLog')) {
+            const helperCode = `
+// Structured logging helper (auto-added by Evolution Engine)
+function structuredLog(level: string, message: string, meta: Record<string, any> = {}): void {
+  console.log(JSON.stringify({ timestamp: new Date().toISOString(), level, message, ...meta }));
+}
+`;
+            // Insert after imports/interfaces section
+            const firstFuncIdx = modifiedContent.indexOf('\nasync function ');
+            const insertIdx = firstFuncIdx > -1 ? firstFuncIdx : modifiedContent.indexOf('\nfunction ');
+            if (insertIdx > -1) {
+              modifiedContent = modifiedContent.slice(0, insertIdx) + helperCode + modifiedContent.slice(insertIdx);
+            }
+          }
+
+          // Replace console.log calls with structuredLog
+          modifiedContent = modifiedContent.replace(
+            /console\.log\((['"`])(.*?)\1\)/g,
+            (match, quote, msg) => `structuredLog('info', ${quote}${msg}${quote})`
+          );
+          modifiedContent = modifiedContent.replace(
+            /console\.log\((['"`])(.*?)\1,\s*(.*?)\)/g,
+            (match, quote, msg, data) => `structuredLog('info', ${quote}${msg}${quote}, { data: ${data} })`
+          );
+          fixDescription = `Replaced ${consoleLogCount} console.log calls with structured JSON logging`;
+        }
+      }
+
+      // ── HARDENING: Missing /health endpoint ──
+      if (finding.includes('Missing /health endpoint')) {
+        if (!modifiedContent.includes("'/health'") && !modifiedContent.includes('"/health"')) {
+          // Find the response/routing section and add a health endpoint
+          const fetchHandlerMatch = modifiedContent.match(/async fetch\s*\(request.*?\)\s*.*?\{/);
+          if (fetchHandlerMatch) {
+            const routeInsertPoint = modifiedContent.indexOf(fetchHandlerMatch[0]) + fetchHandlerMatch[0].length;
+            const healthRoute = `
+    // Health endpoint (auto-added by Evolution Engine)
+    const healthUrl = new URL(request.url);
+    if (healthUrl.pathname === '/health') {
+      return new Response(JSON.stringify({
+        status: 'ok',
+        service: '${repo}',
+        timestamp: new Date().toISOString()
+      }), { headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
+    }
+`;
+            modifiedContent = modifiedContent.slice(0, routeInsertPoint) + healthRoute + modifiedContent.slice(routeInsertPoint);
+            fixDescription = 'Added /health endpoint';
+          }
+        }
+      }
+
+      // ── HARDENING: Missing CORS headers ──
+      if (finding.includes('Missing CORS headers')) {
+        if (!modifiedContent.includes('Access-Control-Allow-Origin')) {
+          // Add CORS helper
+          const corsHelper = `
+// CORS headers (auto-added by Evolution Engine)
+const CORS_HEADERS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, X-Echo-API-Key',
+};
+`;
+          const firstFuncIdx = modifiedContent.indexOf('\nasync function ');
+          const insertIdx = firstFuncIdx > -1 ? firstFuncIdx : 0;
+          modifiedContent = modifiedContent.slice(0, insertIdx) + corsHelper + modifiedContent.slice(insertIdx);
+          fixDescription = 'Added CORS headers constant';
+        }
+      }
+
+      // ── UPGRADE: Still on v1.0.0 ──
+      if (finding.includes('Still on v1.0.0')) {
+        // Just log — version bumps need human review
+        fixDescription = 'Version upgrade noted — requires manual review for breaking changes';
+        await env.DB.prepare(`UPDATE evolution_scans SET status = 'detected', ai_recommendation = ? WHERE id = ?`)
+          .bind('Version v1.0.0 detected. Manual upgrade review recommended — auto-fix skipped to avoid breaking changes.', scanId).run();
+        continue; // Skip push for version upgrades
+      }
+
+      // ── FEATURE: service bindings / cron ──
+      if (finding.includes('Could benefit from service bindings') || finding.includes('could benefit from scheduled tasks')) {
+        // Feature suggestions — log but don't auto-fix
+        await env.DB.prepare(`UPDATE evolution_scans SET status = 'detected', ai_recommendation = ? WHERE id = ?`)
+          .bind(`Feature suggestion noted. ${finding}. This requires architectural changes — flagged for CC session review.`, scanId).run();
+        continue;
+      }
+
+      // Check if we actually made changes
+      if (modifiedContent === originalContent || !fixDescription) {
+        await env.DB.prepare(`UPDATE evolution_scans SET status = 'detected', ai_recommendation = ? WHERE id = ?`)
+          .bind('No safe automated fix available. Flagged for manual review.', scanId).run();
+        continue;
+      }
+
+      // Record the code change
+      await env.DB.prepare(
+        `INSERT INTO code_changes (repo, file_path, change_type, description, before_snippet, after_snippet, sandbox_result, cycle_id)
+         VALUES (?, 'src/index.ts', 'auto_fix', ?, ?, ?, 'pending', ?)`
+      ).bind(repo, fixDescription, originalContent.slice(0, 500), modifiedContent.slice(0, 500), cid).run();
+
+      // Push to GitHub
+      const pushResult = await pushToGitHub(env, repo, 'src/index.ts', modifiedContent,
+        `fix: ${fixDescription} (auto-fix by Evolution Engine)`, fileSha);
+
+      if (pushResult.success) {
+        fixed++;
+        await env.DB.prepare(`UPDATE evolution_scans SET status = 'applied', ai_recommendation = ? WHERE id = ?`)
+          .bind(`Auto-fixed: ${fixDescription}. Commit SHA: ${pushResult.sha}`, scanId).run();
+
+        await logAction(env.DB, {
+          action_type: 'evolution_auto_fix',
+          target: repo,
+          details: fixDescription,
+          result: 'success',
+          duration_ms: 0,
+          cycle_id: cid
+        });
+      } else {
+        failed++;
+        await env.DB.prepare(`UPDATE evolution_scans SET status = 'failed', ai_recommendation = ? WHERE id = ?`)
+          .bind(`Push failed: ${pushResult.error}`, scanId).run();
+      }
+
+    } catch (e: any) {
+      failed++;
+      await env.DB.prepare(`UPDATE evolution_scans SET status = 'failed', ai_recommendation = ? WHERE id = ?`)
+        .bind(`Error: ${e.message}`, scanId).run();
+
+      await logAction(env.DB, {
+        action_type: 'evolution_auto_fix_error',
+        target: repo,
+        details: e.message,
+        result: 'error',
+        duration_ms: 0,
+        cycle_id: cid
+      });
+    }
+  }
+
+  if (attempted > 0) {
+    await incrementStat(env.DB, 'evolution_fixes', fixed);
+    if (fixed > 0) {
+      await reportToBrain(env, `EVOLUTION ENGINE: Auto-fixed ${fixed}/${attempted} findings: ${(detected.results || []).filter((_, i) => i < fixed).map(s => `${s.repo}(${(s.findings as string).slice(0, 40)})`).join(', ')}`, 8, ['evolution', 'auto-fix']);
+    }
+  }
+
+  return { attempted, fixed, failed };
+}
+
+// ═══════════════════════════════════════════════════
+// MODULE 16: DIAGNOSTICS AGENT TRIGGER
+// Triggers the standalone diagnostics agent to scan for
+// missing logging/health/diagnostics across ALL repos
+// ═══════════════════════════════════════════════════
+
+async function triggerDiagnosticsAgent(env: Env, cid: string): Promise<{ triggered: boolean; result?: string }> {
+  try {
+    const resp = await safeFetch('https://echo-diagnostics-agent.bmcii1976.workers.dev/scan', 30000);
+    if (resp && resp.ok) {
+      await logAction(env.DB, {
+        action_type: 'diagnostics_trigger',
+        target: 'echo-diagnostics-agent',
+        details: `Triggered diagnostics scan. Response: ${JSON.stringify(resp.data).slice(0, 200)}`,
+        result: 'success',
+        duration_ms: resp.latencyMs,
+        cycle_id: cid
+      });
+      return { triggered: true, result: 'scan_started' };
+    }
+    return { triggered: false, result: `HTTP ${resp?.status}` };
+  } catch (e: any) {
+    return { triggered: false, result: e.message };
+  }
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -1923,8 +2163,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const qaResult = await processQABugs(env, cid);
       const daemonResult = await processDaemonTasks(env, cid);
       const fixResult = await executeFixQueue(env, cid, 5);
+      const evoFixResult = await executeEvolutionFixes(env, cid);
 
-      const summary = `Cycle ${cid}: QA processed=${qaResult.processed} autoResolved=${qaResult.autoResolved} queued=${qaResult.queued} | Daemon processed=${daemonResult.processed} resolved=${daemonResult.resolved} | Fixes attempted=${fixResult.attempted} fixed=${fixResult.fixed} failed=${fixResult.failed}`;
+      const summary = `Cycle ${cid}: QA processed=${qaResult.processed} autoResolved=${qaResult.autoResolved} queued=${qaResult.queued} | Daemon processed=${daemonResult.processed} resolved=${daemonResult.resolved} | Fixes attempted=${fixResult.attempted} fixed=${fixResult.fixed} failed=${fixResult.failed} | EvoFixes applied=${evoFixResult.applied} failed=${evoFixResult.failed}`;
 
       await logAction(env.DB, {
         action_type: 'cycle_30min',
@@ -1959,8 +2200,10 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const evoScan = await scanRepoForEvolution(env, cid);
       const sandboxResult = await runSandboxTests(env, cid);
       const projectResult = await checkForProjectOpportunities(env, cid);
+      const evoFixResult = await executeEvolutionFixes(env, cid);
+      const diagResult = await triggerDiagnosticsAgent(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.applied} applied | Diagnostics: ${diagResult.status}`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -2032,7 +2275,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'bug_hunting', 'thin_page_fixing', 'github_deployment',
         'upgrade_scanning', 'daily_briefing', 'shared_brain_reporting',
         'moltbook_posting', 'auto_fix_execution',
-        'evolution_scanning', 'sandbox_testing', 'project_creation', 'code_analysis'
+        'evolution_scanning', 'sandbox_testing', 'project_creation', 'code_analysis',
+        'evolution_auto_fix', 'diagnostics_agent_trigger'
       ]
     }), { headers: corsHeaders });
   }
@@ -2150,6 +2394,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     }
     if (module === 'projects') {
       results.projects = await checkForProjectOpportunities(env, cid);
+    }
+    if (module === 'all' || module === 'autofix') {
+      results.autofix = await executeEvolutionFixes(env, cid);
+    }
+    if (module === 'diagnostics') {
+      results.diagnostics = await triggerDiagnosticsAgent(env, cid);
     }
     if (module === 'briefing') {
       results.briefing = await generateDailyBriefing(env, cid);

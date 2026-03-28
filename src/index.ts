@@ -3930,6 +3930,69 @@ async function analyzeFleetTrends(env: Env, cid: string): Promise<TrendReport> {
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 21: STALE DATA PRUNER
+// Prevents unbounded D1 table growth
+// ═══════════════════════════════════════════════════
+
+async function pruneStaleData(env: Env, cid: string): Promise<{ pruned: Record<string, number> }> {
+  const pruned: Record<string, number> = {};
+
+  try {
+    // actions_log: keep 30 days
+    const a1 = await env.DB.prepare(
+      "DELETE FROM actions_log WHERE created_at < datetime('now', '-30 days')"
+    ).run();
+    pruned['actions_log'] = a1.meta?.changes || 0;
+
+    // latency_history: keep 14 days (already exists elsewhere, but consolidate here)
+    const a2 = await env.DB.prepare(
+      "DELETE FROM latency_history WHERE recorded_at < datetime('now', '-14 days')"
+    ).run();
+    pruned['latency_history'] = a2.meta?.changes || 0;
+
+    // fix_queue: keep resolved/failed fixes for 14 days
+    const a3 = await env.DB.prepare(
+      "DELETE FROM fix_queue WHERE status IN ('fixed', 'failed', 'rejected') AND created_at < datetime('now', '-14 days')"
+    ).run();
+    pruned['fix_queue'] = a3.meta?.changes || 0;
+
+    // evolution_scans: keep applied/rejected scans for 30 days
+    const a4 = await env.DB.prepare(
+      "DELETE FROM evolution_scans WHERE status IN ('applied', 'rejected') AND created_at < datetime('now', '-30 days')"
+    ).run();
+    pruned['evolution_scans'] = a4.meta?.changes || 0;
+
+    // daily_stats: keep 90 days
+    const a5 = await env.DB.prepare(
+      "DELETE FROM daily_stats WHERE date < date('now', '-90 days')"
+    ).run();
+    pruned['daily_stats'] = a5.meta?.changes || 0;
+
+    // cron_dedup: keep 1 hour (already done in cron, but belt-and-suspenders)
+    const a6 = await env.DB.prepare(
+      "DELETE FROM cron_dedup WHERE created_at < datetime('now', '-2 hours')"
+    ).run();
+    pruned['cron_dedup'] = a6.meta?.changes || 0;
+
+    const totalPruned = Object.values(pruned).reduce((s, n) => s + n, 0);
+    if (totalPruned > 0) {
+      await logAction(env.DB, {
+        action_type: 'data_prune',
+        target: 'system',
+        details: Object.entries(pruned).filter(([, v]) => v > 0).map(([k, v]) => `${k}: ${v} rows`).join(', '),
+        result: 'success',
+        duration_ms: 0,
+        cycle_id: cid
+      });
+    }
+  } catch (e: any) {
+    await logAction(env.DB, { action_type: 'data_prune', target: 'system', details: `Error: ${e.message}`, result: 'error', duration_ms: 0, cycle_id: cid });
+  }
+
+  return { pruned };
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -4022,9 +4085,10 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       ctx.waitUntil(postToMoltBook(env, summary, 'building', ['audit', 'auto-builder']));
     }
 
-    // ═══ DAILY 8 AM UTC: Briefing ═══
+    // ═══ DAILY 8 AM UTC: Briefing + Pruning ═══
     if (hour === 8 && minute === 0) {
       await generateDailyBriefing(env, cid);
+      ctx.waitUntil(pruneStaleData(env, cid));
     }
 
   } catch (e: any) {
@@ -4151,7 +4215,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'structured_logging_auto_fix', 'root_route_auto_fix',
         'diagnostics_bridge', 'diagnostics_auto_resolve',
         'latency_monitoring', 'latency_degradation_detection',
-        'dependency_audit', 'fleet_trend_analysis'
+        'dependency_audit', 'fleet_trend_analysis', 'stale_data_pruning'
       ]
     }), { headers: corsHeaders });
   }

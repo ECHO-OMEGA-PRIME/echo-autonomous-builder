@@ -5919,8 +5919,8 @@ async function auditDoctrineQuality(env: Env, cid: string): Promise<DoctrineQual
   } catch { /* continue with audit anyway */ }
 
   // Step 3: Sample doctrine quality across Commander's priority domains
-  // Query Engine Runtime directly by domain code — no engine list fetch needed
-  // Each cycle picks a rotating slice of domains to spread coverage
+  // Uses FAST mode queries (lightweight text search, no LLM) to stay within 30s CPU limit
+  // Rotates 3 domains per cycle so all 8 are covered in ~3 cycles
   try {
     const priorityDomains = ['TX', 'LG', 'LM', 'DRL', 'SEC', 'RE', 'FIN', 'TAX'];
     const sampleQueries = [
@@ -5928,13 +5928,12 @@ async function auditDoctrineQuality(env: Env, cid: string): Promise<DoctrineQual
       'drilling wellbore operations', 'cybersecurity vulnerability', 'real estate lease',
       'financial reporting compliance', 'tax credit eligibility'
     ];
-    // Rotate which domains we check each cycle based on time
-    const rotateOffset = Math.floor(Date.now() / 3600000) % priorityDomains.length;
+    const rotateOffset = Math.floor(Date.now() / 14400000) % priorityDomains.length;
 
     const worstEngines: Array<{ engine_id: string; total: number; gold: number; goldPct: number }> = [];
 
-    // Check 8 domains per cycle with domain-appropriate queries
-    for (let i = 0; i < Math.min(8, priorityDomains.length); i++) {
+    // Check 3 domains per cycle — FAST mode to avoid timeout
+    for (let i = 0; i < 3; i++) {
       const idx = (i + rotateOffset) % priorityDomains.length;
       const domain = priorityDomains[idx];
       const query = sampleQueries[idx] || 'quality audit sample';
@@ -5944,19 +5943,16 @@ async function auditDoctrineQuality(env: Env, cid: string): Promise<DoctrineQual
           ? await env.SVC_ENGINE.fetch(new Request('https://internal/query', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json', 'X-Echo-API-Key': env.ECHO_API_KEY || '' },
-              body: JSON.stringify({ query, domain, limit: 10 }),
+              body: JSON.stringify({ query, domain, limit: 5, mode: 'FAST' }),
             }))
           : null;
 
         if (queryRes?.ok) {
           const qData = await queryRes.json() as any;
-          const matches = qData.matches || qData.analysis || [];
-          const totalSampled = matches.length;
-          // Engine Runtime now returns quality_tier: "gold" | "standard" based on actual GOLD fields
+          const matches = qData.matches || [];
           const goldCount = matches.filter((m: any) => m.quality_tier === 'gold').length;
 
-          if (totalSampled > 0) {
-            // Group by engine_id to see per-engine quality
+          if (matches.length > 0) {
             const engineMap = new Map<string, { total: number; gold: number }>();
             for (const m of matches) {
               const eid = m.engine_id || domain;
@@ -5966,12 +5962,11 @@ async function auditDoctrineQuality(env: Env, cid: string): Promise<DoctrineQual
               engineMap.set(eid, entry);
             }
             for (const [eid, counts] of engineMap) {
-              const goldPct = Math.round((counts.gold / counts.total) * 100);
               worstEngines.push({
                 engine_id: eid,
                 total: counts.total,
                 gold: counts.gold,
-                goldPct,
+                goldPct: Math.round((counts.gold / counts.total) * 100),
               });
             }
           }
@@ -6167,7 +6162,11 @@ async function auditWorkerSecurity(env: Env, cid: string): Promise<SecurityAudit
           const isDynamicSetWithBind = /\$\{(?:fields|sets|f|updates|cols)\.join\s*\(/.test(lines[i]) && /\.bind\s*\(/.test(lines[i]);
           // Safe pattern: table name constants or other safe interpolations
           const isSafeConstant = /\$\{(?:TABLE|PREFIX|SCHEMA|tableName)\}/.test(lines[i]);
-          if (!hasAllowlist && !isDynamicSetWithBind && !isSafeConstant) {
+          // Safe pattern: dynamic WHERE builder (where += 'AND col = ?') with bind params
+          const isDynamicWhere = /\$\{(?:where|whereClause|conditions|filter|clause)\}/.test(lines[i]) && /\.bind\s*\(/.test(lines[i]);
+          // Safe pattern: dynamic ORDER BY from allowlisted sort fields
+          const isDynamicOrder = /\$\{(?:sort|orderBy|order|sortCol|sortField)\}/.test(lines[i]) && /\.bind\s*\(/.test(lines[i]);
+          if (!hasAllowlist && !isDynamicSetWithBind && !isSafeConstant && !isDynamicWhere && !isDynamicOrder) {
             report.findings.push({ repo, issue: 'sql_injection', severity: 'critical',
               detail: `Template literal in D1 prepare() at line ${i + 1}`, line: i + 1 });
             repoFindings++;

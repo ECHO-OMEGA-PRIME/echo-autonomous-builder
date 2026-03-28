@@ -229,7 +229,9 @@ const CRITICAL_WORKERS = [
   'echo-ab-testing-engine', 'echo-coin-rewards', 'echo-documents',
   'echo-workflows', 'echo-invoicing', 'echo-appointments',
   'echo-hr-management', 'echo-project-management',
-  'echo-vendor-manager'
+  'echo-vendor-manager',
+  // Persistent slow reporters — daemon flags every cycle (6.8s cold starts)
+  'echo-intel-hub', 'echo-darkweb-intelligence'
 ];
 
 // Deduplicated via Set — prevents double-warming the same worker

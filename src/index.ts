@@ -5918,66 +5918,32 @@ async function auditDoctrineQuality(env: Env, cid: string): Promise<DoctrineQual
     }
   } catch { /* continue with audit anyway */ }
 
-  // Step 3: Sample doctrine quality across Commander's priority domains
-  // Fire all queries in PARALLEL using Promise.allSettled to stay within CPU limits
-  // Rotates 3 domains per cycle so all 8 are covered in ~3 cycles
+  // Step 3: Get per-engine GOLD quality stats via dedicated lightweight endpoint
+  // Single D1 aggregation query on Engine Runtime — returns in <500ms
   try {
-    const priorityDomains = ['TX', 'LG', 'LM', 'DRL', 'SEC', 'RE', 'FIN', 'TAX'];
-    const sampleQueries = [
-      'tax depletion strategy', 'contract analysis breach', 'mineral rights title',
-      'drilling wellbore operations', 'cybersecurity vulnerability', 'real estate lease',
-      'financial reporting compliance', 'tax credit eligibility'
-    ];
-    const rotateOffset = Math.floor(Date.now() / 14400000) % priorityDomains.length;
+    const qualityRes = env.SVC_ENGINE
+      ? await env.SVC_ENGINE.fetch(new Request('https://internal/doctrine-quality', {
+          headers: { 'User-Agent': 'doctrine-auditor', 'X-Echo-API-Key': env.ECHO_API_KEY || '' }
+        }))
+      : await fetch(`${ENGINE_URL}/doctrine-quality`, {
+          headers: { 'User-Agent': 'doctrine-auditor', 'X-Echo-API-Key': env.ECHO_API_KEY || '' }
+        });
 
     const worstEngines: Array<{ engine_id: string; total: number; gold: number; goldPct: number }> = [];
 
-    // Fire 3 domain queries in PARALLEL — each uses FAST mode
-    const queryPromises = Array.from({ length: 3 }, (_, i) => {
-      const idx = (i + rotateOffset) % priorityDomains.length;
-      const domain = priorityDomains[idx];
-      const query = sampleQueries[idx] || 'quality audit sample';
+    if (qualityRes.ok) {
+      const qData = await qualityRes.json() as any;
+      report.totalDoctrines = qData.total_doctrines || report.totalDoctrines;
+      report.goldDoctrines = qData.gold_doctrines || 0;
+      report.goldPct = qData.gold_pct || 0;
 
-      return (async () => {
-        const queryRes = env.SVC_ENGINE
-          ? await env.SVC_ENGINE.fetch(new Request('https://internal/query', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', 'X-Echo-API-Key': env.ECHO_API_KEY || '' },
-              body: JSON.stringify({ query, domain, limit: 5, mode: 'FAST' }),
-            }))
-          : null;
-
-        if (queryRes?.ok) {
-          const qData = await queryRes.json() as any;
-          const matches = qData.matches || [];
-          return { domain, matches };
+      // Filter to priority engines and sort by worst GOLD ratio
+      const priorityPrefixes = ['TX', 'LG', 'LM', 'DRL', 'SEC', 'RE', 'FIN', 'TAX'];
+      const engines = (qData.engines || []) as Array<{ engine_id: string; total: number; gold: number; goldPct: number }>;
+      for (const eng of engines) {
+        if (priorityPrefixes.some(p => eng.engine_id.startsWith(p))) {
+          worstEngines.push(eng);
         }
-        return { domain, matches: [] };
-      })().catch(() => ({ domain: priorityDomains[(i + rotateOffset) % priorityDomains.length], matches: [] as any[] }));
-    });
-
-    const results = await Promise.allSettled(queryPromises);
-
-    for (const result of results) {
-      if (result.status !== 'fulfilled') continue;
-      const { matches } = result.value;
-      if (matches.length === 0) continue;
-
-      const engineMap = new Map<string, { total: number; gold: number }>();
-      for (const m of matches) {
-        const eid = m.engine_id || 'unknown';
-        const entry = engineMap.get(eid) || { total: 0, gold: 0 };
-        entry.total++;
-        if (m.quality_tier === 'gold') entry.gold++;
-        engineMap.set(eid, entry);
-      }
-      for (const [eid, counts] of engineMap) {
-        worstEngines.push({
-          engine_id: eid,
-          total: counts.total,
-          gold: counts.gold,
-          goldPct: Math.round((counts.gold / counts.total) * 100),
-        });
       }
     }
 
@@ -6116,14 +6082,26 @@ async function auditWorkerSecurity(env: Env, cid: string): Promise<SecurityAudit
       const lines = source.split('\n');
 
       // CHECK 1: Unprotected write endpoints (POST/PUT/DELETE without auth)
-      const authPattern = /X-Echo-API-Key|Authorization|Bearer|ECHO_API_KEY|auth.*middleware|checkAuth|requireAuth/i;
-      for (let i = 0; i < lines.length; i++) {
-        if (/method\s*===?\s*['"](?:POST|PUT|DELETE|PATCH)['"]/i.test(lines[i])) {
-          const chunk = lines.slice(Math.max(0, i - 10), Math.min(lines.length, i + 30)).join('\n');
-          if (!authPattern.test(chunk)) {
-            report.findings.push({ repo, issue: 'unprotected_write', severity: 'high',
-              detail: `Write endpoint ~line ${i + 1} has no auth check within 30 lines`, line: i + 1 });
-            repoFindings++;
+      // Detect global auth guards that protect all routes (common pattern: check auth early, return 401)
+      const authPattern = /X-Echo-API-Key|Authorization|Bearer|ECHO_API_KEY|auth.*middleware|checkAuth|requireAuth|authOk|isAuthed|verifyAuth|apiKeyCheck/i;
+      // Check if the file has a global auth guard before route handlers
+      const globalAuthBlock = source.slice(0, Math.min(source.length, 15000));
+      const hasGlobalAuth = /(?:if\s*\(\s*!(?:authOk|checkAuth|isAuthed|verifyAuth|apiKeyCheck)\s*\(|if\s*\(\s*!.*(?:X-Echo-API-Key|ECHO_API_KEY|Authorization))/i.test(globalAuthBlock);
+      // Hono-style: app.use('*', authMiddleware) or app.use('/api/*', ...)
+      const hasMiddlewareAuth = /app\.use\s*\(\s*['"][/*].*['"].*auth/i.test(source);
+      // If the entire file uses a global auth guard, skip this check (all routes are protected)
+      if (!hasGlobalAuth && !hasMiddlewareAuth) {
+        for (let i = 0; i < lines.length; i++) {
+          if (/method\s*===?\s*['"](?:POST|PUT|DELETE|PATCH)['"]/i.test(lines[i])) {
+            // Skip intentionally public routes
+            const routeCtx = lines.slice(Math.max(0, i - 5), i + 1).join('\n');
+            if (/\/public\//i.test(routeCtx)) continue;
+            const chunk = lines.slice(Math.max(0, i - 15), Math.min(lines.length, i + 30)).join('\n');
+            if (!authPattern.test(chunk)) {
+              report.findings.push({ repo, issue: 'unprotected_write', severity: 'high',
+                detail: `Write endpoint ~line ${i + 1} has no auth check within 30 lines`, line: i + 1 });
+              repoFindings++;
+            }
           }
         }
       }

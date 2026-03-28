@@ -1,10 +1,10 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.8.0 — "Fleet Changelog Generator"
+ * ECHO AUTONOMOUS BUILDER v3.11.0 — "Infrastructure Anomaly Detector"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
  *
- * 24 Modules:
+ * 27 Modules:
  * 1. Worker Warmer — keeps critical workers warm, eliminates cold-start latency alerts
  * 2. QA Bug Processor — auto-resolves false positives, queues real fixes
  * 3. Daemon Task Resolver — resolves pending performance tasks
@@ -29,6 +29,9 @@
  * 22. Adaptive Cold-Start Warmup — extra warmups for repeat cold-start workers
  * 23. Fleet Changelog Generator — tracks daily fleet changes, generates summaries
  * 24. Worker Version Drift Detector — alerts when versions diverge across fleet
+ * 25. Cron Health Monitor — detects when cron-based Workers stop executing
+ * 26. Infrastructure Anomaly Detector — distinguishes fleet-wide CF issues from individual worker issues
+ * 27. On-Demand Fleet Report — comprehensive /report endpoint for instant fleet status
  *
  * Cron Schedule:
  * - every 5 min: warm up critical workers + quick health pulse
@@ -4819,6 +4822,145 @@ async function monitorCronHealth(env: Env, cid: string): Promise<{ checked: numb
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 27: INFRASTRUCTURE ANOMALY DETECTOR
+// Distinguishes fleet-wide slowdowns (CF platform issue) from individual worker issues.
+// When >30% of workers degrade simultaneously, classifies as infra event and suppresses noise.
+// ═══════════════════════════════════════════════════
+
+interface InfraAnomalyResult {
+  analyzed: number;
+  degradedCount: number;
+  degradedPct: number;
+  classification: 'healthy' | 'individual_issues' | 'infrastructure_event' | 'insufficient_data';
+  degradedWorkers: string[];
+  avgFleetLatency: number;
+  baselineFleetLatency: number;
+  recommendation: string;
+}
+
+async function detectInfrastructureAnomaly(env: Env, cid: string): Promise<InfraAnomalyResult> {
+  const result: InfraAnomalyResult = {
+    analyzed: 0, degradedCount: 0, degradedPct: 0,
+    classification: 'insufficient_data', degradedWorkers: [],
+    avgFleetLatency: 0, baselineFleetLatency: 0, recommendation: '',
+  };
+
+  try {
+    // Current fleet latency: last 30 minutes
+    const current = await env.DB.prepare(`
+      SELECT worker_name, AVG(latency_ms) as avg_lat, COUNT(*) as cnt
+      FROM latency_history
+      WHERE recorded_at > datetime('now', '-30 minutes') AND healthy = 1
+      GROUP BY worker_name HAVING cnt >= 2
+    `).all();
+
+    // Baseline: 24h average per worker (excluding last 30 min)
+    const baseline = await env.DB.prepare(`
+      SELECT worker_name, AVG(latency_ms) as avg_lat, COUNT(*) as cnt
+      FROM latency_history
+      WHERE recorded_at > datetime('now', '-24 hours')
+        AND recorded_at <= datetime('now', '-30 minutes')
+        AND healthy = 1
+      GROUP BY worker_name HAVING cnt >= 5
+    `).all();
+
+    if (!current.results?.length || !baseline.results?.length) {
+      result.recommendation = 'Not enough data for comparison.';
+      return result;
+    }
+
+    const baselineMap = new Map<string, number>();
+    for (const b of baseline.results as any[]) {
+      baselineMap.set(b.worker_name, b.avg_lat);
+    }
+
+    let totalCurrentLat = 0, totalBaselineLat = 0, compared = 0;
+    const degraded: string[] = [];
+
+    for (const c of current.results as any[]) {
+      const name = c.worker_name as string;
+      const bLat = baselineMap.get(name);
+      if (!bLat) continue;
+
+      compared++;
+      totalCurrentLat += c.avg_lat;
+      totalBaselineLat += bLat;
+
+      // Degraded if >2x baseline AND absolute > 500ms
+      if (c.avg_lat > bLat * 2 && c.avg_lat > 500) {
+        degraded.push(name);
+      }
+    }
+
+    if (compared < 5) {
+      result.recommendation = 'Too few comparable workers.';
+      return result;
+    }
+
+    result.analyzed = compared;
+    result.degradedCount = degraded.length;
+    result.degradedPct = Math.round((degraded.length / compared) * 100);
+    result.degradedWorkers = degraded;
+    result.avgFleetLatency = Math.round(totalCurrentLat / compared);
+    result.baselineFleetLatency = Math.round(totalBaselineLat / compared);
+
+    // Classification logic:
+    // >30% degraded simultaneously = infrastructure event
+    // 10-30% = possible infrastructure event
+    // <10% = individual worker issues
+    if (result.degradedPct >= 30) {
+      result.classification = 'infrastructure_event';
+      result.recommendation = `${result.degradedPct}% of fleet degraded simultaneously. Likely Cloudflare platform issue — individual worker alerts suppressed. Fleet avg: ${result.avgFleetLatency}ms vs baseline ${result.baselineFleetLatency}ms.`;
+    } else if (result.degradedPct >= 10) {
+      result.classification = 'individual_issues';
+      result.recommendation = `${result.degradedPct}% of fleet degraded — borderline. Monitoring. Individual alerts will fire for: ${degraded.join(', ')}.`;
+    } else if (degraded.length > 0) {
+      result.classification = 'individual_issues';
+      result.recommendation = `${degraded.length} individual workers degraded. Likely per-worker issues, not platform-wide.`;
+    } else {
+      result.classification = 'healthy';
+      result.recommendation = `Fleet healthy. Avg latency: ${result.avgFleetLatency}ms.`;
+    }
+
+    // Log the analysis
+    await logAction(env.DB, {
+      action_type: 'infra_anomaly_check',
+      target: 'fleet',
+      details: `${result.classification}: ${compared} analyzed, ${degraded.length} degraded (${result.degradedPct}%). Fleet avg: ${result.avgFleetLatency}ms vs baseline ${result.baselineFleetLatency}ms.`,
+      result: result.classification,
+      duration_ms: result.avgFleetLatency,
+      cycle_id: cid
+    });
+
+    // Only alert Brain on actual infrastructure events (dedup via KV)
+    if (result.classification === 'infrastructure_event') {
+      const dedupKey = `infra_anomaly_alert_${today()}`;
+      const existing = await env.CACHE.get(dedupKey);
+      if (!existing) {
+        await reportToBrain(env,
+          `INFRASTRUCTURE ANOMALY DETECTED: ${result.degradedPct}% of fleet degraded simultaneously (${degraded.length}/${compared} workers). ` +
+          `Fleet avg ${result.avgFleetLatency}ms vs baseline ${result.baselineFleetLatency}ms. ` +
+          `Likely Cloudflare platform issue. Individual worker alerts suppressed.`,
+          9, ['infra-anomaly', 'alert', 'platform']);
+        await env.CACHE.put(dedupKey, JSON.stringify({ ts: new Date().toISOString(), pct: result.degradedPct }), { expirationTtl: 7200 });
+      }
+    }
+
+  } catch (e: any) {
+    await logAction(env.DB, {
+      action_type: 'infra_anomaly_error',
+      target: 'fleet',
+      details: e.message,
+      result: 'error',
+      duration_ms: 0,
+      cycle_id: cid
+    });
+  }
+
+  return result;
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -4904,8 +5046,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const trendReport = await analyzeFleetTrends(env, cid);
       const versionDrift = await detectVersionDrift(env, cid);
       const cronHealth = await monitorCronHealth(env, cid);
+      const infraAnomaly = await detectInfrastructureAnomaly(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | CronHealth: ${cronHealth.healthy}/${cronHealth.checked} healthy, ${cronHealth.stale.length} stale`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | CronHealth: ${cronHealth.healthy}/${cronHealth.checked} healthy, ${cronHealth.stale.length} stale | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%)`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -4975,6 +5118,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       description: 'The EXECUTION ENGINE for ECHO OMEGA PRIME — autonomous code fixes, deployments, and fleet maintenance',
       endpoints: {
         health: '/health',
+        report: '/report',
         status: '/status',
         workers: '/workers',
         queue: '/queue',
@@ -4987,10 +5131,13 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         diagnosticsBridge: '/diagnostics/bridge',
         latency: '/latency',
         latencyDegraded: '/latency/degraded',
+        infraAnomaly: '/infra-anomaly',
         verify: '/verify',
         adaptive: '/adaptive',
         changelog: '/changelog',
         drift: '/drift',
+        cronHealth: '/cron-health',
+        fleetOverview: '/fleet-overview',
       }
     }), { headers: corsHeaders });
   }
@@ -5064,7 +5211,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'dependency_audit', 'fleet_trend_analysis', 'stale_data_pruning',
         'api_endpoint_verification', 'auth_protection_audit', 'error_handling_audit',
         'adaptive_cold_start_warmup',
-        'fleet_changelog_generation', 'version_drift_detection'
+        'fleet_changelog_generation', 'version_drift_detection',
+        'infrastructure_anomaly_detection', 'on_demand_fleet_report'
       ]
     }), { headers: corsHeaders });
   }
@@ -5132,6 +5280,128 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       })),
       recentAnalysis: recentAnalysis.results
     }), { headers: corsHeaders });
+  }
+
+  // ─── /infra-anomaly ─── Infrastructure-level anomaly detection
+  if (path === '/infra-anomaly') {
+    const cid = cycleId();
+    const anomaly = await detectInfrastructureAnomaly(env, cid);
+    return new Response(JSON.stringify({
+      service: 'echo-autonomous-builder',
+      module: 'infrastructure-anomaly-detector',
+      ...anomaly,
+      timestamp: new Date().toISOString()
+    }), { headers: corsHeaders });
+  }
+
+  // ─── /report ─── Comprehensive on-demand fleet health report
+  if (path === '/report') {
+    const cid = cycleId();
+
+    // Parallel data collection for maximum speed
+    const [
+      todayStats,
+      workerProfiles,
+      pendingFixes,
+      recentActions,
+      latencyData,
+      cronHealth,
+      infraAnomaly,
+      evolutionScans,
+      recentDeploys,
+      recentAlerts,
+      daemonHealth,
+    ] = await Promise.all([
+      env.DB.prepare(`SELECT * FROM daily_stats WHERE date = ?`).bind(today()).first(),
+      env.DB.prepare(`SELECT worker_name, avg_latency_ms, health_score, check_count, healthy_count, last_check, last_version FROM worker_profiles ORDER BY health_score ASC`).all(),
+      env.DB.prepare(`SELECT COUNT(*) as cnt FROM fix_queue WHERE status = 'pending'`).first() as Promise<any>,
+      env.DB.prepare(`SELECT action_type, COUNT(*) as cnt FROM actions_log WHERE created_at > datetime('now', '-24 hours') GROUP BY action_type ORDER BY cnt DESC LIMIT 20`).all(),
+      env.DB.prepare(`
+        SELECT worker_name, ROUND(AVG(latency_ms)) as avg_ms, MAX(latency_ms) as max_ms, COUNT(*) as samples
+        FROM latency_history WHERE recorded_at > datetime('now', '-4 hours')
+        GROUP BY worker_name ORDER BY avg_ms DESC LIMIT 20
+      `).all(),
+      monitorCronHealth(env, cid),
+      detectInfrastructureAnomaly(env, cid),
+      env.DB.prepare(`SELECT scan_type, status, COUNT(*) as cnt FROM evolution_scans GROUP BY scan_type, status`).all(),
+      env.DB.prepare(`SELECT * FROM deploy_history ORDER BY created_at DESC LIMIT 10`).all(),
+      env.DB.prepare(`SELECT target, details, created_at FROM actions_log WHERE action_type IN ('cron_stale','latency_degradation','infra_anomaly_check') AND created_at > datetime('now', '-24 hours') ORDER BY created_at DESC LIMIT 20`).all(),
+      (env as any).SVC_DAEMON ? (env as any).SVC_DAEMON.fetch(new Request('https://x/health')).then((r: Response) => r.json()).catch(() => null) : Promise.resolve(null),
+    ]);
+
+    const profiles = (workerProfiles.results || []) as any[];
+    const totalWorkers = profiles.length;
+    const healthyWorkers = profiles.filter(w => w.health_score >= 80).length;
+    const degradedWorkers = profiles.filter(w => w.health_score > 0 && w.health_score < 80);
+    const avgFleetLatency = profiles.length > 0
+      ? Math.round(profiles.reduce((s, w) => s + (w.avg_latency_ms || 0), 0) / profiles.length)
+      : 0;
+
+    // Uptime calc: healthy / total checks
+    const totalChecks = profiles.reduce((s, w) => s + (w.check_count || 0), 0);
+    const totalHealthy = profiles.reduce((s, w) => s + (w.healthy_count || 0), 0);
+    const uptimePct = totalChecks > 0 ? ((totalHealthy / totalChecks) * 100).toFixed(2) : '100.00';
+
+    const report = {
+      service: 'echo-autonomous-builder',
+      reportType: 'comprehensive-fleet-health',
+      generatedAt: new Date().toISOString(),
+      cycleId: cid,
+
+      summary: {
+        fleetScore: daemonHealth?.fleetScore || 100,
+        totalWorkers,
+        healthyWorkers,
+        degradedWorkerCount: degradedWorkers.length,
+        avgFleetLatencyMs: avgFleetLatency,
+        uptimePercent: parseFloat(uptimePct),
+        pendingFixes: pendingFixes?.cnt || 0,
+        builderVersion: env.WORKER_VERSION,
+        daemonVersion: daemonHealth?.version || 'unknown',
+      },
+
+      todayActivity: {
+        warmups: (todayStats as any)?.warmups || 0,
+        bugsFound: (todayStats as any)?.bugs_found || 0,
+        bugsFixed: (todayStats as any)?.bugs_fixed || 0,
+        bugsAutoResolved: (todayStats as any)?.bugs_auto_resolved || 0,
+        tasksResolved: (todayStats as any)?.tasks_resolved || 0,
+        deploys: (todayStats as any)?.deploys || 0,
+        pagesFixed: (todayStats as any)?.pages_fixed || 0,
+      },
+
+      infrastructure: {
+        anomalyClassification: infraAnomaly.classification,
+        degradedPercent: infraAnomaly.degradedPct,
+        degradedWorkers: infraAnomaly.degradedWorkers,
+        currentFleetLatency: infraAnomaly.avgFleetLatency,
+        baselineFleetLatency: infraAnomaly.baselineFleetLatency,
+        recommendation: infraAnomaly.recommendation,
+      },
+
+      cronHealth: {
+        checked: cronHealth.checked,
+        healthy: cronHealth.healthy,
+        staleTargets: cronHealth.stale,
+        errors: cronHealth.errors,
+      },
+
+      topLatency: (latencyData.results || []).slice(0, 10),
+
+      degradedWorkerDetails: degradedWorkers.slice(0, 10).map(w => ({
+        name: w.worker_name,
+        healthScore: w.health_score,
+        avgLatency: w.avg_latency_ms,
+        lastCheck: w.last_check,
+      })),
+
+      actionBreakdown: recentActions.results || [],
+      recentDeploys: recentDeploys.results || [],
+      recentAlerts: recentAlerts.results || [],
+      evolutionScans: evolutionScans.results || [],
+    };
+
+    return new Response(JSON.stringify(report), { headers: corsHeaders });
   }
 
   // ─── /cron-health ───

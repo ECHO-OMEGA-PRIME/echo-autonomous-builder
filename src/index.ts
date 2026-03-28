@@ -1,5 +1,5 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.15.0 — "Report: Engine Runtime + Doctrine Forge Data"
+ * ECHO AUTONOMOUS BUILDER v3.16.0 — "Latency Percentiles Dashboard"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
@@ -5332,6 +5332,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       daemonHealth,
       engineRuntimeHealth,
       doctrineForgeStats,
+      allLatencies,
     ] = await Promise.all([
       env.DB.prepare(`SELECT * FROM daily_stats WHERE date = ?`).bind(today()).first(),
       env.DB.prepare(`SELECT worker_name, avg_latency_ms, health_score, check_count, healthy_count, last_check, last_version FROM worker_profiles ORDER BY health_score ASC`).all(),
@@ -5350,6 +5351,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       (env as any).SVC_DAEMON ? (env as any).SVC_DAEMON.fetch(new Request('https://x/health')).then((r: Response) => r.json()).catch(() => null) : Promise.resolve(null),
       (env as any).SVC_ENGINE ? (env as any).SVC_ENGINE.fetch(new Request('https://x/health')).then((r: Response) => r.json()).catch(() => null) : Promise.resolve(null),
       (env as any).SVC_DOCTRINE ? (env as any).SVC_DOCTRINE.fetch(new Request('https://x/stats')).then((r: Response) => r.json()).catch(() => null) : Promise.resolve(null),
+      env.DB.prepare(`SELECT latency_ms FROM latency_history WHERE recorded_at > datetime('now', '-4 hours') AND healthy = 1 ORDER BY latency_ms ASC`).all(),
     ]);
 
     const profiles = (workerProfiles.results || []) as any[];
@@ -5372,6 +5374,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         uptimePct = ((uptimeData.healthy_cnt / uptimeData.total) * 100).toFixed(2);
       }
     } catch { /* fallback to 100% if table doesn't exist */ }
+
+    // Compute fleet latency percentiles
+    const latencyValues = ((allLatencies as any).results || []).map((r: any) => r.latency_ms as number);
+    const pctl = (arr: number[], p: number) => arr.length > 0 ? arr[Math.min(Math.floor(arr.length * p), arr.length - 1)] : 0;
 
     const report = {
       service: 'echo-autonomous-builder',
@@ -5435,6 +5441,15 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
           generated: doctrineForgeStats.total_doctrines_generated || 0,
         };
       })(),
+
+      latencyPercentiles: {
+        samples: latencyValues.length,
+        p50: Math.round(pctl(latencyValues, 0.50)),
+        p90: Math.round(pctl(latencyValues, 0.90)),
+        p95: Math.round(pctl(latencyValues, 0.95)),
+        p99: Math.round(pctl(latencyValues, 0.99)),
+        max: latencyValues.length > 0 ? Math.round(latencyValues[latencyValues.length - 1]) : 0,
+      },
 
       topLatency: (latencyData.results || []).slice(0, 10),
 
@@ -5884,6 +5899,7 @@ h1{color:#ff6b35;font-size:1.8rem;margin-bottom:4px}
   <div class="card" id="activity-card"><h2>Today's Activity</h2><div id="activity">Loading...</div></div>
   <div class="card" id="infra-card"><h2>Infrastructure</h2><div id="infra">Loading...</div></div>
   <div class="card" id="cron-card"><h2>Cron Health</h2><div id="crons">Loading...</div></div>
+  <div class="card" id="pctile-card"><h2>Latency Percentiles</h2><div id="pctiles">Loading...</div></div>
   <div class="card" id="latency-card"><h2>Top Latency</h2><div id="latency">Loading...</div></div>
   <div class="card" id="engine-card"><h2>Engine Runtime</h2><div id="engines">Loading...</div></div>
 </div>
@@ -5906,6 +5922,7 @@ async function load(){
     const tl=d.topLatency||[];
     const er=d.engineRuntime||{};
     const df=d.doctrineForge||{};
+    const lp=d.latencyPercentiles||{};
     document.getElementById('error').style.display='none';
     document.getElementById('version').textContent='v'+s.builderVersion+' | '+s.totalWorkers+' workers monitored | Generated '+new Date(d.generatedAt).toLocaleTimeString();
     // Fleet
@@ -5960,6 +5977,16 @@ async function load(){
       m('Queries',er.queries?.toLocaleString()||'—')+
       m('Forge Status',(df.complete||0)+'/'+(df.total||0)+' complete',(df.complete===df.total&&df.total>0)?'good':'warn')+
       m('Generated',df.generated?.toLocaleString()||'—');
+    // Latency Percentiles
+    if(lp.samples>0){
+      document.getElementById('pctiles').innerHTML=
+        m('Samples',lp.samples?.toLocaleString())+
+        m('p50',lp.p50+'ms',lp.p50<300?'good':lp.p50<1000?'warn':'bad')+
+        m('p90',lp.p90+'ms',lp.p90<1000?'good':lp.p90<3000?'warn':'bad')+
+        m('p95',lp.p95+'ms',lp.p95<2000?'good':lp.p95<5000?'warn':'bad')+
+        m('p99',lp.p99+'ms',lp.p99<5000?'good':lp.p99<10000?'warn':'bad')+
+        m('Max',lp.max+'ms',lp.max<5000?'good':'bad');
+    }else{document.getElementById('pctiles').innerHTML='<span style="color:#555">No latency data</span>';}
   }catch(e){
     document.getElementById('error').textContent='Failed to load: '+e.message;
     document.getElementById('error').style.display='block';

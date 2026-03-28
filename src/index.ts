@@ -483,7 +483,11 @@ async function initDB(db: D1Database): Promise<void> {
       healthy INTEGER DEFAULT 1,
       recorded_at TEXT DEFAULT (datetime('now'))
     )`),
-    db.prepare(`CREATE INDEX IF NOT EXISTS idx_latency_worker_time ON latency_history (worker_name, recorded_at)`)
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_latency_worker_time ON latency_history (worker_name, recorded_at)`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_actions_created ON actions_log (created_at)`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_actions_type_target ON actions_log (action_type, target)`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_fixqueue_status ON fix_queue (status, created_at)`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_evolution_status ON evolution_scans (status, created_at)`)
   ]);
 }
 
@@ -2747,6 +2751,20 @@ async function generateDailyBriefing(env: Env, cid: string): Promise<string> {
     }
   } catch { trendSection = ''; }
 
+  // ── Run cron health check for briefing ──
+  let cronSection = '';
+  try {
+    const cronHealth = await monitorCronHealth(env, cid);
+    if (cronHealth.stale.length > 0) {
+      cronSection = `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nCRON HEALTH: ${cronHealth.healthy}/${cronHealth.checked} healthy | ${cronHealth.stale.length} STALE:\n${cronHealth.stale.map(s => `  ⚠ ${s}`).join('\n')}`;
+    } else {
+      cronSection = `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nCRON HEALTH: ${cronHealth.healthy}/${cronHealth.checked} healthy — all crons firing on schedule`;
+    }
+    if (cronHealth.errors.length > 0) {
+      cronSection += `\n  ERRORS: ${cronHealth.errors.join(', ')}`;
+    }
+  } catch { cronSection = ''; }
+
   const briefing = `DAILY AUTONOMOUS BUILDER BRIEFING — ${d}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WARMUPS: ${todayWarmups} pings${trend(todayWarmups, yesterdayWarmups)}
@@ -2767,6 +2785,7 @@ TOP PERFORMERS:
 ${topList || '  (insufficient data)'}
 ${bottomList ? `NEEDS ATTENTION:\n${bottomList}` : 'ALL WORKERS HEALTHY (95%+)'}
 ${trendSection}
+${cronSection}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RECENT ACTIONS:
 ${(recentActions.results || []).slice(0, 10).map((a: any) => `  ${a.created_at} | ${a.action_type} → ${a.target} [${a.result}]`).join('\n')}`;
@@ -4138,11 +4157,16 @@ async function pruneStaleData(env: Env, cid: string): Promise<{ pruned: Record<s
   const pruned: Record<string, number> = {};
 
   try {
-    // actions_log: keep 30 days
-    const a1 = await env.DB.prepare(
-      "DELETE FROM actions_log WHERE created_at < datetime('now', '-30 days')"
+    // actions_log: keep 7 days for most types, 3 days for high-frequency warmup noise
+    const a1a = await env.DB.prepare(
+      "DELETE FROM actions_log WHERE action_type IN ('warmup','warmup_complete','warmup_failure','cold_start_warmup') AND created_at < datetime('now', '-3 days')"
     ).run();
-    pruned['actions_log'] = a1.meta?.changes || 0;
+    pruned['actions_log_warmups'] = a1a.meta?.changes || 0;
+
+    const a1b = await env.DB.prepare(
+      "DELETE FROM actions_log WHERE created_at < datetime('now', '-7 days')"
+    ).run();
+    pruned['actions_log'] = a1b.meta?.changes || 0;
 
     // latency_history: keep 14 days (already exists elsewhere, but consolidate here)
     const a2 = await env.DB.prepare(
@@ -4632,6 +4656,38 @@ const CRON_TARGETS: CronTarget[] = [
     timestampPath: 'timestamp',
     graceFactor: 3,
   },
+  {
+    name: 'echo-email-marketing',
+    binding: 'SVC_EMAILMKT',
+    expectedIntervalMin: 30,
+    statusEndpoint: '/health',
+    timestampPath: 'timestamp',
+    graceFactor: 6, // Alert if >3 hours since last cron
+  },
+  {
+    name: 'echo-calendar',
+    binding: 'SVC_CALENDAR',
+    expectedIntervalMin: 15,
+    statusEndpoint: '/health',
+    timestampPath: 'timestamp',
+    graceFactor: 8, // Alert if >2 hours since last cron
+  },
+  {
+    name: 'echo-workflow-automation',
+    binding: 'SVC_WORKFLOW',
+    expectedIntervalMin: 15,
+    statusEndpoint: '/health',
+    timestampPath: 'timestamp',
+    graceFactor: 8,
+  },
+  {
+    name: 'echo-autonomous-builder',
+    binding: '__SELF__', // Special marker: self-check via DB query
+    expectedIntervalMin: 5,
+    statusEndpoint: '/health',
+    timestampPath: 'timestamp',
+    graceFactor: 3, // Alert if >15 min since last cron
+  },
 ];
 
 function extractNestedTimestamp(obj: any, path: string): string | null {
@@ -4654,10 +4710,32 @@ async function monitorCronHealth(env: Env, cid: string): Promise<{ checked: numb
   for (const target of CRON_TARGETS) {
     try {
       let response: Response;
+
+      // Self-check: query own DB for last cron cycle instead of HTTP
+      if (target.binding === '__SELF__') {
+        results.checked++;
+        const row = await env.DB.prepare(
+          "SELECT created_at FROM actions_log WHERE action_type IN ('cycle_30min','cycle_4hour','warmup_complete') ORDER BY id DESC LIMIT 1"
+        ).first<{ created_at: string }>();
+        if (row?.created_at) {
+          const lastRun = new Date(row.created_at + 'Z').getTime();
+          const ageMin = (Date.now() - lastRun) / 60000;
+          const threshold = target.expectedIntervalMin * target.graceFactor;
+          if (ageMin > threshold) {
+            results.stale.push(`${target.name}: last run ${Math.round(ageMin)}min ago (expected every ${target.expectedIntervalMin}min, threshold ${threshold}min)`);
+          } else {
+            results.healthy++;
+          }
+        } else {
+          results.healthy++; // No rows yet — just deployed
+        }
+        continue;
+      }
+
       if (target.binding && (env as any)[target.binding]) {
         response = await (env as any)[target.binding].fetch(new Request(`https://internal${target.statusEndpoint}`));
-      } else if (target.url) {
-        response = await fetch(`${target.url}${target.statusEndpoint}`, { signal: AbortSignal.timeout(10000) });
+      } else if ((target as any).url) {
+        response = await fetch(`${(target as any).url}${target.statusEndpoint}`, { signal: AbortSignal.timeout(10000) });
       } else {
         continue;
       }

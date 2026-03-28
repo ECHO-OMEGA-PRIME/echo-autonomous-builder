@@ -5891,91 +5891,93 @@ async function auditDoctrineQuality(env: Env, cid: string): Promise<DoctrineQual
     return report;
   }
 
+  // Check forge queue depth (used in Step 4 to decide whether to trigger new forging)
+  let forgeBusy = false;
   try {
-    // Get forge stats to understand current production rate
     const statsRes = await forgeBinding.fetch(new Request('https://internal/stats', {
       headers: { 'User-Agent': 'doctrine-auditor' }
     }));
     if (statsRes.ok) {
       const statsData = await statsRes.json() as any;
-      // Queue status helps us know if engines are already being processed
       const queue = statsData.queue || [];
       const pendingInQueue = queue.find((q: any) => q.status === 'pending')?.cnt || 0;
       const forgingInQueue = queue.find((q: any) => q.status === 'forging')?.cnt || 0;
-
-      // If there are already many pending/forging, don't add more
-      if (pendingInQueue > 50 || forgingInQueue > 5) {
-        await logAction(env.DB, {
-          action_type: 'doctrine_audit',
-          target: 'doctrine_forge',
-          details: `Forge busy: ${pendingInQueue} pending, ${forgingInQueue} forging. Skipping re-queue.`,
-          result: 'skipped',
-          duration_ms: 0,
-          cycle_id: cid,
-        });
-        return report;
-      }
+      forgeBusy = pendingInQueue > 50 || forgingInQueue > 5;
+      (report as any)._forgeQueue = { pending: pendingInQueue, forging: forgingInQueue, busy: forgeBusy };
     }
   } catch { /* continue with audit anyway */ }
 
   // Step 3: Get per-engine GOLD quality stats via dedicated lightweight endpoint
   // Single D1 aggregation query on Engine Runtime — returns in <500ms
+  // MUST use service binding (same-account Workers can't fetch each other's public URLs)
   try {
     const qualityRes = env.SVC_ENGINE
       ? await env.SVC_ENGINE.fetch(new Request('https://internal/doctrine-quality', {
-          headers: { 'User-Agent': 'doctrine-auditor', 'X-Echo-API-Key': env.ECHO_API_KEY || '' }
+          headers: { 'User-Agent': 'doctrine-auditor' }
         }))
       : await fetch(`${ENGINE_URL}/doctrine-quality`, {
-          headers: { 'User-Agent': 'doctrine-auditor', 'X-Echo-API-Key': env.ECHO_API_KEY || '' }
+          headers: { 'User-Agent': 'doctrine-auditor' }
         });
 
     const worstEngines: Array<{ engine_id: string; total: number; gold: number; goldPct: number }> = [];
 
-    if (qualityRes.ok) {
-      const qData = await qualityRes.json() as any;
-      report.totalDoctrines = qData.total_doctrines || report.totalDoctrines;
-      report.goldDoctrines = qData.gold_doctrines || 0;
-      report.goldPct = qData.gold_pct || 0;
+    // Capture raw text first for debugging
+    const rawText = await qualityRes.text();
+    (report as any)._raw_status = qualityRes.status;
+    (report as any)._raw_length = rawText.length;
+    (report as any)._raw_preview = rawText.substring(0, 200);
 
-      // Filter to priority engines and sort by worst GOLD ratio
-      const priorityPrefixes = ['TX', 'LG', 'LM', 'DRL', 'SEC', 'RE', 'FIN', 'TAX'];
-      const engines = (qData.engines || []) as Array<{ engine_id: string; total: number; gold: number; goldPct: number }>;
-      for (const eng of engines) {
-        if (priorityPrefixes.some(p => eng.engine_id.startsWith(p))) {
-          worstEngines.push(eng);
+    if (qualityRes.ok || qualityRes.status === 200) {
+      try {
+        const qData = JSON.parse(rawText) as any;
+        if (qData.ok && qData.total_doctrines) {
+          report.totalDoctrines = qData.total_doctrines;
+          report.goldDoctrines = qData.gold_doctrines || 0;
+          report.goldPct = qData.gold_pct || 0;
         }
+
+        // Filter to priority engines and sort by worst GOLD ratio
+        const priorityPrefixes = ['TX', 'LG', 'LM', 'DRL', 'SEC', 'RE', 'FIN', 'TAX'];
+        const engines = (qData.engines || []) as Array<{ engine_id: string; total: number; gold: number; goldPct: number }>;
+        for (const eng of engines) {
+          if (priorityPrefixes.some(p => eng.engine_id.startsWith(p))) {
+            worstEngines.push(eng);
+          }
+        }
+        (report as any)._debug = { engines_received: engines.length, priority_matched: worstEngines.length, gold_from_api: qData.gold_doctrines, qData_ok: qData.ok, sample_ids: engines.slice(0, 5).map((e: any) => e.engine_id) };
+      } catch (parseErr: any) {
+        report.forgeErrors.push(`JSON parse error: ${parseErr.message} | raw: ${rawText.substring(0, 100)}`);
       }
+    } else {
+      report.forgeErrors.push(`/doctrine-quality HTTP ${qualityRes.status}: ${rawText.substring(0, 100)}`);
     }
 
-    // Sort by worst GOLD ratio
+    // Sort by worst GOLD ratio — show engines that most need upgrading
     worstEngines.sort((a, b) => a.goldPct - b.goldPct);
     report.worstEngines = worstEngines.slice(0, 20);
+    // Note: report.goldDoctrines and report.goldPct already set from /doctrine-quality global totals
 
-    // Estimate GOLD stats from samples
-    const totalSampled = worstEngines.reduce((s, e) => s + e.total, 0);
-    const goldSampled = worstEngines.reduce((s, e) => s + e.gold, 0);
-    report.goldDoctrines = goldSampled;
-    report.goldPct = totalSampled > 0 ? Math.round((goldSampled / totalSampled) * 100) : 0;
-
-    // Step 4: Trigger Doctrine Forge for engines with 0% GOLD
-    const zeroGoldEngines = worstEngines.filter(e => e.goldPct === 0).slice(0, 3); // Max 3 per cycle
-    for (const eng of zeroGoldEngines) {
-      try {
-        const forgeRes = await forgeBinding.fetch(new Request('https://internal/forge', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Echo-API-Key': env.ECHO_API_KEY || '',
-          },
-          body: JSON.stringify({ engine_id: eng.engine_id, count: 1 }),
-        }));
-        if (forgeRes.ok) {
-          report.forgeTriggered++;
-        } else {
-          report.forgeErrors.push(`${eng.engine_id}: HTTP ${forgeRes.status}`);
+    // Step 4: Trigger Doctrine Forge for engines with 0% GOLD (only if forge isn't busy)
+    if (!forgeBusy) {
+      const zeroGoldEngines = worstEngines.filter(e => e.goldPct === 0).slice(0, 3);
+      for (const eng of zeroGoldEngines) {
+        try {
+          const forgeRes = await forgeBinding.fetch(new Request('https://internal/forge', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Echo-API-Key': env.ECHO_API_KEY || '',
+            },
+            body: JSON.stringify({ engine_id: eng.engine_id, count: 1 }),
+          }));
+          if (forgeRes.ok) {
+            report.forgeTriggered++;
+          } else {
+            report.forgeErrors.push(`${eng.engine_id}: HTTP ${forgeRes.status}`);
+          }
+        } catch (e: any) {
+          report.forgeErrors.push(`${eng.engine_id}: ${e.message}`);
         }
-      } catch (e: any) {
-        report.forgeErrors.push(`${eng.engine_id}: ${e.message}`);
       }
     }
   } catch (e: any) {
@@ -6082,24 +6084,34 @@ async function auditWorkerSecurity(env: Env, cid: string): Promise<SecurityAudit
       const lines = source.split('\n');
 
       // CHECK 1: Unprotected write endpoints (POST/PUT/DELETE without auth)
-      // Detect global auth guards that protect all routes (common pattern: check auth early, return 401)
-      const authPattern = /X-Echo-API-Key|Authorization|Bearer|ECHO_API_KEY|auth.*middleware|checkAuth|requireAuth|authOk|isAuthed|verifyAuth|apiKeyCheck/i;
-      // Check if the file has a global auth guard before route handlers
+      const authPattern = /X-Echo-API-Key|Authorization|Bearer|ECHO_API_KEY|auth.*middleware|checkAuth|requireAuth|authOk|isAuthed|verifyAuth|apiKeyCheck|verifyFirebaseJWT/i;
+      // Detect global auth guards (traditional if-check pattern)
       const globalAuthBlock = source.slice(0, Math.min(source.length, 15000));
       const hasGlobalAuth = /(?:if\s*\(\s*!(?:authOk|checkAuth|isAuthed|verifyAuth|apiKeyCheck)\s*\(|if\s*\(\s*!.*(?:X-Echo-API-Key|ECHO_API_KEY|Authorization))/i.test(globalAuthBlock);
-      // Hono-style: app.use('*', authMiddleware) or app.use('/api/*', ...)
-      const hasMiddlewareAuth = /app\.use\s*\(\s*['"][/*].*['"].*auth/i.test(source);
-      // If the entire file uses a global auth guard, skip this check (all routes are protected)
-      if (!hasGlobalAuth && !hasMiddlewareAuth) {
+      const isHono = /(?:import.*Hono|new\s+Hono\s*\()/i.test(source);
+      // Hono middleware auth: app.use('*', ...) with auth inside OR named auth ref
+      const hasMiddlewareAuth = /app\.use\s*\(\s*['"][/*]/.test(source) &&
+        /(?:X-Echo-API-Key|ECHO_API_KEY|Authorization|Bearer|requireAuth|verifyFirebaseJWT|verifyJWT|authenticate)/i.test(source);
+      // Hono: requireAuth function defined as middleware factory
+      const hasAuthFactory = /function\s+requireAuth|const\s+requireAuth|function\s+authenticate/i.test(source);
+      // Any file that defines a JWT verifier or auth function early on
+      const hasAuthFunction = /(?:function|const|async\s+function)\s+(?:verifyFirebaseJWT|verifyJWT|checkAuth|validateToken|authMiddleware)/i.test(globalAuthBlock);
+      const hasEffectiveAuth = hasGlobalAuth || hasMiddlewareAuth || hasAuthFactory || hasAuthFunction;
+      if (!hasEffectiveAuth) {
         for (let i = 0; i < lines.length; i++) {
-          if (/method\s*===?\s*['"](?:POST|PUT|DELETE|PATCH)['"]/i.test(lines[i])) {
+          // Match both raw method check AND Hono-style route declarations
+          const isWriteRaw = /method\s*===?\s*['"](?:POST|PUT|DELETE|PATCH)['"]/i.test(lines[i]);
+          const isWriteHono = isHono && /app\.(?:post|put|delete|patch)\s*\(\s*['"]/.test(lines[i]);
+          if (isWriteRaw || isWriteHono) {
             // Skip intentionally public routes
             const routeCtx = lines.slice(Math.max(0, i - 5), i + 1).join('\n');
             if (/\/public\//i.test(routeCtx)) continue;
-            const chunk = lines.slice(Math.max(0, i - 15), Math.min(lines.length, i + 30)).join('\n');
+            // For Hono routes, check handler body (next 50 lines) and preceding middleware
+            const scanRange = isWriteHono ? 50 : 30;
+            const chunk = lines.slice(Math.max(0, i - 15), Math.min(lines.length, i + scanRange)).join('\n');
             if (!authPattern.test(chunk)) {
               report.findings.push({ repo, issue: 'unprotected_write', severity: 'high',
-                detail: `Write endpoint ~line ${i + 1} has no auth check within 30 lines`, line: i + 1 });
+                detail: `Write endpoint ~line ${i + 1} has no auth check within ${scanRange} lines`, line: i + 1 });
               repoFindings++;
             }
           }
@@ -6176,6 +6188,33 @@ async function auditWorkerSecurity(env: Env, cid: string): Promise<SecurityAudit
       if (!hasRateLimit && source.length > 500 && /method\s*===?\s*['"]GET['"]/i.test(source)) {
         report.findings.push({ repo, issue: 'no_rate_limiting', severity: 'low',
           detail: 'No rate limiting detected for public endpoints' });
+        repoFindings++;
+      }
+
+      // CHECK 6: Exposed secrets in responses or logs
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.trim().startsWith('//') || line.trim().startsWith('*')) continue;
+        // Detect env vars being returned in JSON responses
+        if (/(?:json|return|Response)\s*\(.*env\.\w*(?:KEY|SECRET|TOKEN|PASSWORD|PASS|CRED)/i.test(line)) {
+          report.findings.push({ repo, issue: 'exposed_secret', severity: 'critical',
+            detail: `Possible secret leak in response at line ${i + 1}`, line: i + 1 });
+          repoFindings++;
+        }
+        // Detect logging of secrets
+        if (/console\.(?:log|warn|error|info)\s*\(.*env\.\w*(?:KEY|SECRET|TOKEN|PASSWORD)/i.test(line)) {
+          report.findings.push({ repo, issue: 'logged_secret', severity: 'high',
+            detail: `Secret may be logged at line ${i + 1}`, line: i + 1 });
+          repoFindings++;
+        }
+      }
+
+      // CHECK 7: Missing input validation on user data
+      const hasInputValidation = /(?:sanitize|validate|escape|zod|yup|joi|z\.string|z\.object|\.parse\(|\.safeParse\()/i.test(source);
+      const hasUserInput = /(?:c\.req\.json|c\.req\.param|request\.json|req\.body|req\.query|url\.searchParams)/i.test(source);
+      if (hasUserInput && !hasInputValidation && source.length > 1000) {
+        report.findings.push({ repo, issue: 'no_input_validation', severity: 'medium',
+          detail: 'No input validation library detected (Zod, sanitize, etc.)' });
         repoFindings++;
       }
 

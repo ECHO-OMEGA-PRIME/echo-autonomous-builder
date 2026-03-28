@@ -6126,11 +6126,21 @@ async function auditWorkerSecurity(env: Env, cid: string): Promise<SecurityAudit
         }
       }
 
-      // CHECK 3: Open CORS (wildcard origin)
+      // CHECK 3: Open CORS (wildcard origin) — smart classification
+      // Workers serving embeddable widgets/scripts legitimately need wildcard CORS
+      const isEmbeddableWorker = /widget\.js|script\.js|embed|pixel|tracking|beacon|public.*api/i.test(source) ||
+        ['echo-web-analytics', 'echo-live-chat', 'echo-newsletter', 'echo-waitlist',
+         'echo-feedback-board', 'echo-link-shortener', 'echo-reviews', 'echo-signatures',
+         'echo-affiliate'].includes(repo);
+      // Workers handling sensitive data should NOT have wildcard CORS
+      const isSensitiveWorker = ['echo-vault-api', 'echo-payroll', 'echo-hr', 'echo-finance-ai',
+        'echo-contracts', 'echo-compliance', 'echo-recruiting'].includes(repo);
       for (let i = 0; i < lines.length; i++) {
         if (/['"]Access-Control-Allow-Origin['"]\s*[:,]\s*['"]\*['"]/.test(lines[i])) {
-          report.findings.push({ repo, issue: 'open_cors', severity: 'medium',
-            detail: `Wildcard CORS at line ${i + 1}`, line: i + 1 });
+          const severity = isSensitiveWorker ? 'high' : isEmbeddableWorker ? 'low' : 'medium';
+          const label = isEmbeddableWorker ? ' (embeddable worker — expected)' : isSensitiveWorker ? ' (sensitive data worker!)' : '';
+          report.findings.push({ repo, issue: 'open_cors', severity,
+            detail: `Wildcard CORS at line ${i + 1}${label}`, line: i + 1 });
           repoFindings++;
         }
       }
@@ -6203,6 +6213,32 @@ async function auditWorkerSecurity(env: Env, cid: string): Promise<SecurityAudit
         report.findings.push({ repo, issue: 'no_input_validation', severity: 'medium',
           detail: 'No input validation library detected (Zod, sanitize, etc.)' });
         repoFindings++;
+      }
+
+      // CHECK 8: Unsafe error handling — leaking stack traces to clients
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.trim().startsWith('//') || line.trim().startsWith('*')) continue;
+        // Pattern: returning e.stack or e.message directly in response
+        if (/(?:json|Response)\s*\(.*(?:e\.stack|error\.stack|err\.stack)/i.test(line)) {
+          report.findings.push({ repo, issue: 'stack_trace_leak', severity: 'medium',
+            detail: `Stack trace may be leaked in response at line ${i + 1}`, line: i + 1 });
+          repoFindings++;
+        }
+      }
+
+      // CHECK 9: Timing-safe auth comparison
+      // Workers using direct string comparison (===) for secrets are vulnerable to timing attacks
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.trim().startsWith('//') || line.trim().startsWith('*')) continue;
+        // Pattern: apiKey !== env.ECHO_API_KEY or similar direct string compare for auth
+        if (/(?:apiKey|key|token|secret|password)\s*[!=]==?\s*(?:env\.|c\.env\.|process\.env\.)\w*(?:KEY|SECRET|TOKEN|PASS)/i.test(line) &&
+            !/timingSafe|crypto\.subtle|constant.?time/i.test(lines.slice(Math.max(0, i - 5), Math.min(lines.length, i + 5)).join('\n'))) {
+          report.findings.push({ repo, issue: 'timing_unsafe_auth', severity: 'low',
+            detail: `Auth uses direct string comparison instead of timing-safe compare at line ${i + 1}`, line: i + 1 });
+          repoFindings++;
+        }
       }
 
       if (repoFindings === 0) report.clean++;

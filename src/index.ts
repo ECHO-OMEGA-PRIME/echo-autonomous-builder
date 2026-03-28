@@ -1,5 +1,5 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.2.0 — "Evolution Engine + Diagnostics Bridge + Latency Monitor"
+ * ECHO AUTONOMOUS BUILDER v3.3.0 — "Evolution Engine + Diagnostics Bridge + Latency Monitor + Fleet Dedup"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
@@ -170,39 +170,33 @@ const CRITICAL_WORKERS = [
   'echo-calendar', 'echo-workflow-automation', 'echo-finance-ai'
 ];
 
-const ALL_MONITORED_WORKERS = [
+// Deduplicated via Set — prevents double-warming the same worker
+const ALL_MONITORED_WORKERS = [...new Set([
   ...CRITICAL_WORKERS,
-  'echo-x-bot', 'echo-linkedin', 'echo-telegram', 'echo-reddit-bot',
-  'echo-instagram', 'echo-gs343-cloud', 'echo-landman-pipeline',
+  'echo-x-bot', 'echo-instagram', 'echo-gs343-cloud', 'echo-landman-pipeline',
   'echo-news-scraper', 'echo-reddit-monitor', 'echo-price-alerts',
   'echo-crypto-trader', 'echo-darkweb-intelligence', 'echo-graph-rag',
-  'echo-ai-orchestrator', 'echo-qa-tester', 'echo-bot-auditor',
-  'echo-intel-hub', 'echo-arcanum', 'echo-relay',
+  'echo-ai-orchestrator', 'echo-bot-auditor',
+  'echo-intel-hub', 'echo-relay',
   'echo-config-manager', 'echo-alert-router', 'echo-log-aggregator',
   'echo-rate-limiter', 'echo-usage-tracker', 'echo-cron-orchestrator',
   'echo-notification-hub', 'echo-service-registry', 'echo-health-dashboard',
   'echo-circuit-breaker', 'echo-cost-optimizer',
-  'echo-home-ai', 'echo-shepherd-ai', 'echo-call-center',
-  'echo-crm', 'echo-helpdesk', 'echo-project-manager',
-  'echo-booking', 'echo-invoice', 'echo-forms', 'echo-inventory',
-  'echo-hr', 'echo-contracts', 'echo-lms', 'echo-analytics-engine',
-  'echo-finance-ai', 'echo-email-marketing', 'echo-surveys',
-  'echo-knowledge-base', 'echo-workflow-automation', 'echo-social-media',
-  'echo-document-manager', 'echo-live-chat', 'echo-link-shortener',
+  'echo-shepherd-ai', 'echo-inventory', 'echo-contracts', 'echo-lms',
+  'echo-email-marketing', 'echo-surveys', 'echo-knowledge-base',
+  'echo-social-media', 'echo-document-manager', 'echo-link-shortener',
   'echo-feedback-board', 'echo-newsletter', 'echo-web-analytics',
   'echo-waitlist', 'echo-reviews', 'echo-signatures', 'echo-affiliate',
   'echo-proposals', 'echo-gamer-companion', 'echo-qr-menu',
-  'echo-podcast', 'echo-payroll', 'echo-calendar', 'echo-compliance',
-  'echo-recruiting', 'echo-timesheet', 'echo-email-sender',
+  'echo-podcast', 'echo-compliance', 'echo-timesheet',
   'echo-paypal', 'echo-feature-flags', 'echo-expense', 'echo-okr',
   'echo-autonomous-builder', 'echo-deployment-coordinator',
   'echo-distributed-tracing', 'echo-secrets-rotator',
   'echo-incident-manager', 'echo-backup-coordinator',
-  'echo-report-generator', 'echo-diagnostics-agent',
-  'echo-vendor-manager', 'echo-document-manager',
+  'echo-diagnostics-agent', 'echo-vendor-manager',
   'echo-messenger', 'echo-whatsapp', 'echo-slack',
   'echo-memory-prime', 'echo-status-page', 'omniscient-sync'
-];
+])];
 
 const KNOWN_REDIRECT_PAGES = [
   '/scrapers', '/security', '/pentesting', '/crypto-trading',
@@ -537,9 +531,16 @@ async function safeFetchWithHeaders(url: string, headers: Record<string, string>
 async function warmUpWorkers(env: Env, cid: string, workersToWarm: string[] = CRITICAL_WORKERS): Promise<WorkerCheckResult[]> {
   const results: WorkerCheckResult[] = [];
 
+  // Filter to only workers with service bindings — same-account workers without
+  // bindings get 404 from Cloudflare's routing, producing false failures
+  const reachable = workersToWarm.filter(w => {
+    const key = SERVICE_BINDING_MAP[w];
+    return key && env[key];
+  });
+
   // Warm up in parallel batches of 10
-  for (let i = 0; i < workersToWarm.length; i += 10) {
-    const batch = workersToWarm.slice(i, i + 10);
+  for (let i = 0; i < reachable.length; i += 10) {
+    const batch = reachable.slice(i, i + 10);
     const batchResults = await Promise.allSettled(
       batch.map(async (worker) => {
         const healthPath = getHealthPath(worker);
@@ -593,13 +594,15 @@ async function warmUpWorkers(env: Env, cid: string, workersToWarm: string[] = CR
   await incrementStat(env.DB, 'warmups', results.length);
   await incrementStat(env.DB, 'workers_checked', results.length);
 
+  const skipped = workersToWarm.length - reachable.length;
   await logAction(env.DB, {
     action_type: 'warmup',
     target: `${results.length} workers`,
     details: JSON.stringify({
       warmed: results.filter(r => r.healthy).length,
       failed: results.filter(r => !r.healthy).length,
-      avgLatency: Math.round(results.reduce((s, r) => s + r.latencyMs, 0) / results.length)
+      skipped_no_binding: skipped,
+      avgLatency: results.length > 0 ? Math.round(results.reduce((s, r) => s + r.latencyMs, 0) / results.length) : 0
     }),
     result: results.every(r => r.healthy) ? 'all_healthy' : 'some_unhealthy',
     duration_ms: 0,
@@ -1093,9 +1096,15 @@ async function huntBugs(env: Env, cid: string): Promise<{ scanned: number; issue
   let scanned = 0, issuesFound = 0;
   const issues: Array<{ worker: string; issue: string; severity: string; details: string }> = [];
 
-  // Check all workers in parallel batches
-  for (let i = 0; i < ALL_MONITORED_WORKERS.length; i += 15) {
-    const batch = ALL_MONITORED_WORKERS.slice(i, i + 15);
+  // Only scan workers with service bindings — unbound workers produce false 404s
+  const reachableWorkers = ALL_MONITORED_WORKERS.filter(w => {
+    const key = SERVICE_BINDING_MAP[w];
+    return key && env[key];
+  });
+
+  // Check all reachable workers in parallel batches
+  for (let i = 0; i < reachableWorkers.length; i += 15) {
+    const batch = reachableWorkers.slice(i, i + 15);
     const results = await Promise.allSettled(
       batch.map(async (worker) => {
         scanned++;

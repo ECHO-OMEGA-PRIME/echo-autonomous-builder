@@ -6950,10 +6950,23 @@ async function catalogWorkerEndpoints(env: Env, cid: string): Promise<CatalogRes
   const result: CatalogResult = { scanned: 0, discovered: 0, errors: 0, newEndpoints: 0 };
 
   // Gather all worker names from the binding map
-  const workerNames = Object.keys(WORKER_BINDING_MAP);
+  const workerNames = Object.keys(SERVICE_BINDING_MAP);
 
-  // Batch: scan up to 30 workers per cycle to stay within CPU budget
-  const batchSize = 30;
+  // Also add known public-only workers not in SERVICE_BINDING_MAP
+  const publicOnlyWorkers = [
+    'echo-config-manager', 'echo-alert-router', 'echo-log-aggregator',
+    'echo-rate-limiter', 'echo-usage-tracker', 'echo-api-gateway',
+    'echo-notification-hub', 'echo-secrets-rotator', 'echo-distributed-tracing',
+    'echo-service-registry', 'echo-health-dashboard', 'echo-deployment-coordinator',
+    'echo-circuit-breaker', 'echo-incident-manager', 'echo-cost-optimizer',
+    'echo-diagnostics-agent', 'echo-backup-coordinator', 'echo-autonomous-daemon',
+  ];
+  for (const w of publicOnlyWorkers) {
+    if (!workerNames.includes(w)) workerNames.push(w);
+  }
+
+  // Batch: scan up to 20 workers per cycle to stay within CPU budget
+  const batchSize = 20;
   const idxStr = await env.CACHE.get('catalog_scan_idx') || '0';
   let startIdx = parseInt(idxStr, 10) % workerNames.length;
   const batch = workerNames.slice(startIdx, startIdx + batchSize);
@@ -6967,7 +6980,7 @@ async function catalogWorkerEndpoints(env: Env, cid: string): Promise<CatalogRes
   await Promise.all(batch.map(async (workerName) => {
     result.scanned++;
     try {
-      const bindingKey = WORKER_BINDING_MAP[workerName];
+      const bindingKey = SERVICE_BINDING_MAP[workerName];
       const binding = (env as any)[bindingKey] as Fetcher | undefined;
       let resp: Response;
 

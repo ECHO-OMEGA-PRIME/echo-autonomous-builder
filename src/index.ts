@@ -6256,14 +6256,27 @@ async function auditWorkerSecurity(env: Env, cid: string): Promise<SecurityAudit
     )`).run();
 
     for (const f of report.findings) {
-      const existing = await env.DB.prepare(
+      // Check for existing open finding (skip if already tracked)
+      const existingOpen = await env.DB.prepare(
         "SELECT id FROM security_findings WHERE repo = ? AND issue = ? AND detail = ? AND status = 'open'"
       ).bind(f.repo, f.issue, f.detail).first();
-      if (!existing) {
+      if (existingOpen) continue;
+
+      // Check for previously-resolved finding — REOPEN it instead of creating duplicate
+      const existingResolved = await env.DB.prepare(
+        "SELECT id FROM security_findings WHERE repo = ? AND issue = ? AND detail = ? AND status = 'resolved'"
+      ).bind(f.repo, f.issue, f.detail).first<{ id: number }>();
+      if (existingResolved) {
         await env.DB.prepare(
-          "INSERT INTO security_findings (cycle_id, repo, issue, severity, detail, line_number) VALUES (?, ?, ?, ?, ?, ?)"
-        ).bind(cid, f.repo, f.issue, f.severity, f.detail, f.line || null).run();
+          "UPDATE security_findings SET status = 'reopened', cycle_id = ?, resolved_at = NULL WHERE id = ?"
+        ).bind(cid, existingResolved.id).run();
+        continue;
       }
+
+      // New finding — insert
+      await env.DB.prepare(
+        "INSERT INTO security_findings (cycle_id, repo, issue, severity, detail, line_number) VALUES (?, ?, ?, ?, ?, ?)"
+      ).bind(cid, f.repo, f.issue, f.severity, f.detail, f.line || null).run();
     }
   } catch { /* table creation race */ }
 
@@ -7270,8 +7283,10 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     const severity = url.searchParams.get('severity') || '';
     const status = url.searchParams.get('status') || 'open';
     try {
-      let query = `SELECT * FROM security_findings WHERE status = ?`;
-      const params: any[] = [status];
+      // 'open' status includes 'reopened' findings
+      const statusFilter = status === 'open' ? "status IN ('open', 'reopened')" : 'status = ?';
+      let query = `SELECT * FROM security_findings WHERE ${statusFilter}`;
+      const params: any[] = status === 'open' ? [] : [status];
       if (severity) {
         query += ` AND severity = ?`;
         params.push(severity);
@@ -7280,7 +7295,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       params.push(limit);
       const findings = await env.DB.prepare(query).bind(...params).all();
       const counts = await env.DB.prepare(
-        "SELECT severity, COUNT(*) as count FROM security_findings WHERE status = 'open' GROUP BY severity"
+        "SELECT severity, COUNT(*) as count FROM security_findings WHERE status IN ('open', 'reopened') GROUP BY severity"
       ).all();
       return new Response(JSON.stringify({
         findings: findings.results || [],

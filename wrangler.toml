@@ -3,6 +3,10 @@ main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "echo_metrics"
+
 [triggers]
 crons = ["*/5 * * * *", "*/30 * * * *", "0 */4 * * *", "0 8 * * *"]
 

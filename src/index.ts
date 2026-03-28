@@ -134,14 +134,23 @@ interface DaemonTask {
 // ═══════════════════════════════════════════════════
 
 const CRITICAL_WORKERS = [
+  // Core infrastructure — always warm
   'echo-shared-brain', 'echo-engine-runtime', 'echo-chat',
   'echo-knowledge-forge', 'echo-speak-cloud', 'echo-doctrine-forge',
   'echo-sdk-gateway', 'echo-vault-api', 'echo-build-orchestrator',
   'echo-autonomous-daemon', 'echo-swarm-brain',
-  // Workers that frequently trigger cold-start latency daemon tasks
+  // Bot fleet — revenue generators
   'echo-reddit-bot', 'echo-linkedin', 'echo-telegram',
+  // Infrastructure
   'echo-arcanum', 'echo-analytics-engine', 'echo-qa-tester',
-  'echo-home-ai', 'echo-call-center', 'echo-crm'
+  // Revenue-critical SaaS products
+  'echo-home-ai', 'echo-call-center', 'echo-crm',
+  'echo-helpdesk', 'echo-booking', 'echo-invoice',
+  'echo-live-chat', 'echo-payroll', 'echo-recruiting',
+  'echo-email-sender', 'echo-report-generator',
+  // High-traffic products
+  'echo-forms', 'echo-project-manager', 'echo-hr',
+  'echo-calendar', 'echo-workflow-automation', 'echo-finance-ai'
 ];
 
 const ALL_MONITORED_WORKERS = [
@@ -171,7 +180,11 @@ const ALL_MONITORED_WORKERS = [
   'echo-paypal', 'echo-feature-flags', 'echo-expense', 'echo-okr',
   'echo-autonomous-builder', 'echo-deployment-coordinator',
   'echo-distributed-tracing', 'echo-secrets-rotator',
-  'echo-incident-manager', 'echo-backup-coordinator'
+  'echo-incident-manager', 'echo-backup-coordinator',
+  'echo-report-generator', 'echo-diagnostics-agent',
+  'echo-vendor-manager', 'echo-document-manager',
+  'echo-messenger', 'echo-whatsapp', 'echo-slack',
+  'echo-memory-prime', 'echo-status-page', 'omniscient-sync'
 ];
 
 const KNOWN_REDIRECT_PAGES = [

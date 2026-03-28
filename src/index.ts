@@ -1,10 +1,10 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.7.0 — "Adaptive Cold-Start Warmup"
+ * ECHO AUTONOMOUS BUILDER v3.8.0 — "Fleet Changelog Generator"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
  *
- * Capabilities:
+ * 24 Modules:
  * 1. Worker Warmer — keeps critical workers warm, eliminates cold-start latency alerts
  * 2. QA Bug Processor — auto-resolves false positives, queues real fixes
  * 3. Daemon Task Resolver — resolves pending performance tasks
@@ -14,19 +14,28 @@
  * 7. Worker Health Auditor — comprehensive health scoring per worker
  * 8. Upgrade Scanner — identifies workers needing upgrades
  * 9. Self-Reporter — logs everything to Shared Brain + MoltBook
- * 10. Daily Briefing — compiles overnight results
- * 11. Upgrade Scanner — profile-based upgrade identification
- * 12. Evolution Code Scanner — scans GitHub repos for upgrade/hardening/optimization/feature opportunities
- * 13. Sandbox Tester — tests changes in isolation before promoting to live
- * 14. Autonomous Project Creator — identifies ecosystem gaps, proposes new projects
- * 15. Diagnostics Bridge — fetches diagnostics findings, verifies real vs false positive, auto-resolves
- * 16. Latency Monitor — records per-worker latency history, detects degradation (2.5x baseline), alerts Brain
+ * 10. Daily Briefing v2 — compiles overnight results with trend analytics
+ * 11. Evolution Code Scanner — scans GitHub repos for opportunities
+ * 12. Sandbox Tester — tests changes in isolation before promoting
+ * 13. Autonomous Project Creator — identifies ecosystem gaps
+ * 14. Evolution Fix Executor — applies discovered fixes automatically
+ * 15. Diagnostics Bridge — fetches + auto-resolves diagnostics findings
+ * 16. Latency Monitor — per-worker latency history + degradation detection
+ * 17. Fix Pattern Auto-Resolver — resolves known-pattern QA bugs
+ * 18. Dependency Audit — scans for outdated package versions
+ * 19. Fleet Health Trend Analyzer — multi-hour trend, cold-start, P95 analysis
+ * 20. Stale Data Pruner — prevents unbounded D1 table growth
+ * 21. API Endpoint Verifier — deep health checks (JSON, CORS, auth, error handling)
+ * 22. Adaptive Cold-Start Warmup — extra warmups for repeat cold-start workers
+ * 23. Fleet Changelog Generator — tracks daily fleet changes, generates summaries
+ * 24. Worker Version Drift Detector — alerts when versions diverge across fleet
  *
  * Cron Schedule:
  * - every 5 min: warm up critical workers + quick health pulse
- * - every 30 min: QA bug triage + daemon task processing + auto-fixes
- * - every 4 hours: full system audit + bug hunt + upgrade scan + evolution scan + sandbox tests + project analysis
- * - daily 8am: daily briefing report
+ * - every 15 min (offset): adaptive cold-start warmup for repeat offenders
+ * - every 30 min: QA bug triage + daemon tasks + auto-fixes + endpoint verify
+ * - every 4 hours: full system audit + bug hunt + evolution + diagnostics + trends
+ * - daily 8am: daily briefing + changelog + pruning
  */
 
 interface Env {
@@ -4193,6 +4202,181 @@ async function adaptiveColdStartWarmup(env: Env, cid: string): Promise<{ warmed:
   }
 }
 
+// ═══════════════════════════════════════════���═══════
+// MODULE 24: FLEET CHANGELOG GENERATOR
+// Generates a daily changelog of what changed across the fleet
+// ═══════════════════════════════════════════════════
+
+interface ChangelogEntry {
+  type: 'version_change' | 'new_worker' | 'health_change' | 'latency_shift';
+  worker: string;
+  detail: string;
+}
+
+async function generateFleetChangelog(env: Env, cid: string): Promise<{ entries: ChangelogEntry[] }> {
+  const entries: ChangelogEntry[] = [];
+
+  try {
+    // 1. Version changes — workers whose version changed in the last 24h
+    const profiles = await env.DB.prepare(
+      `SELECT worker_name, last_version, avg_latency_ms, health_score, check_count
+       FROM worker_profiles WHERE check_count >= 5`
+    ).all();
+
+    // Track versions in KV for comparison
+    const prevVersionsRaw = await env.CACHE.get('fleet_versions', 'json') as Record<string, string> | null;
+    const prevVersions = prevVersionsRaw || {};
+    const currentVersions: Record<string, string> = {};
+
+    for (const w of (profiles.results || []) as any[]) {
+      const name = w.worker_name;
+      const ver = w.last_version || 'unknown';
+      currentVersions[name] = ver;
+
+      if (prevVersions[name] && prevVersions[name] !== ver) {
+        entries.push({
+          type: 'version_change',
+          worker: name,
+          detail: `${prevVersions[name]} → ${ver}`
+        });
+      } else if (!prevVersions[name] && Object.keys(prevVersions).length > 0) {
+        entries.push({
+          type: 'new_worker',
+          worker: name,
+          detail: `First seen (v${ver})`
+        });
+      }
+    }
+
+    // Store current versions for next comparison
+    await env.CACHE.put('fleet_versions', JSON.stringify(currentVersions), { expirationTtl: 86400 * 7 });
+
+    // 2. Significant latency shifts (>50% change from stored baseline)
+    const prevLatencyRaw = await env.CACHE.get('fleet_latency_baseline', 'json') as Record<string, number> | null;
+    const prevLatency = prevLatencyRaw || {};
+    const currentLatency: Record<string, number> = {};
+
+    for (const w of (profiles.results || []) as any[]) {
+      const name = w.worker_name;
+      const lat = Math.round(w.avg_latency_ms || 0);
+      currentLatency[name] = lat;
+
+      if (prevLatency[name] && lat > 0) {
+        const change = (lat - prevLatency[name]) / prevLatency[name];
+        if (Math.abs(change) > 0.5 && Math.abs(lat - prevLatency[name]) > 50) {
+          entries.push({
+            type: 'latency_shift',
+            worker: name,
+            detail: `${prevLatency[name]}ms �� ${lat}ms (${change > 0 ? '+' : ''}${Math.round(change * 100)}%)`
+          });
+        }
+      }
+    }
+
+    await env.CACHE.put('fleet_latency_baseline', JSON.stringify(currentLatency), { expirationTtl: 86400 * 7 });
+
+    // 3. Health score changes
+    const prevHealthRaw = await env.CACHE.get('fleet_health_baseline', 'json') as Record<string, number> | null;
+    const prevHealth = prevHealthRaw || {};
+    const currentHealth: Record<string, number> = {};
+
+    for (const w of (profiles.results || []) as any[]) {
+      const name = w.worker_name;
+      const hs = Math.round(w.health_score || 100);
+      currentHealth[name] = hs;
+
+      if (prevHealth[name] !== undefined && prevHealth[name] !== hs) {
+        if (Math.abs(hs - prevHealth[name]) >= 5) {
+          entries.push({
+            type: 'health_change',
+            worker: name,
+            detail: `${prevHealth[name]}% → ${hs}%`
+          });
+        }
+      }
+    }
+
+    await env.CACHE.put('fleet_health_baseline', JSON.stringify(currentHealth), { expirationTtl: 86400 * 7 });
+
+    // Log changelog
+    if (entries.length > 0) {
+      const summary = entries.map(e => `${e.type}: ${e.worker} (${e.detail})`).join('; ');
+      await logAction(env.DB, {
+        action_type: 'fleet_changelog',
+        target: 'fleet',
+        details: `${entries.length} changes detected: ${summary.slice(0, 500)}`,
+        result: 'changes_found',
+        duration_ms: 0,
+        cycle_id: cid
+      });
+    } else {
+      await logAction(env.DB, {
+        action_type: 'fleet_changelog',
+        target: 'fleet',
+        details: 'No significant fleet changes detected',
+        result: 'stable',
+        duration_ms: 0,
+        cycle_id: cid
+      });
+    }
+
+    return { entries };
+  } catch (e: any) {
+    await logAction(env.DB, {
+      action_type: 'fleet_changelog',
+      target: 'fleet',
+      details: `Error: ${e.message}`,
+      result: 'error',
+      duration_ms: 0,
+      cycle_id: cid
+    });
+    return { entries: [] };
+  }
+}
+
+// ═══════════════════════════════════════════════════
+// MODULE 25: WORKER VERSION DRIFT DETECTOR
+// Alerts when fleet versions are too scattered
+// ═════════════════════════════════���═════════════════
+
+async function detectVersionDrift(env: Env, cid: string): Promise<{ driftScore: number; groups: Record<string, string[]> }> {
+  try {
+    const profiles = await env.DB.prepare(
+      `SELECT worker_name, last_version FROM worker_profiles WHERE last_version IS NOT NULL AND last_version != ''`
+    ).all();
+
+    const groups: Record<string, string[]> = {};
+    for (const w of (profiles.results || []) as any[]) {
+      const ver = w.last_version || 'unknown';
+      if (!groups[ver]) groups[ver] = [];
+      groups[ver].push(w.worker_name);
+    }
+
+    const totalWorkers = profiles.results?.length || 1;
+    const uniqueVersions = Object.keys(groups).length;
+    // Drift score: 0 = all same version, 100 = all different versions
+    const driftScore = Math.round(((uniqueVersions - 1) / Math.max(totalWorkers - 1, 1)) * 100);
+
+    // Find workers on old versions (not the most common version)
+    const sortedVersions = Object.entries(groups).sort((a, b) => b[1].length - a[1].length);
+    const mostCommon = sortedVersions[0]?.[0];
+    const outliers = sortedVersions.filter(([ver]) => ver !== mostCommon);
+
+    await logAction(env.DB, {
+      action_type: 'version_drift',
+      target: 'fleet',
+      details: `${uniqueVersions} unique versions across ${totalWorkers} workers. Drift score: ${driftScore}. Most common: ${mostCommon} (${groups[mostCommon]?.length} workers). Outlier groups: ${outliers.length}`,
+      result: driftScore > 50 ? 'high_drift' : 'acceptable',
+      duration_ms: 0,
+      cycle_id: cid
+    });
+
+    return { driftScore, groups };
+  } catch (e: any) {
+    return { driftScore: 0, groups: {} };
+  }
+}
+
 // ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
@@ -4276,8 +4460,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const latencyCheck = await detectLatencyDegradation(env, cid);
       const depAudit = await auditDependencies(env, cid);
       const trendReport = await analyzeFleetTrends(env, cid);
+      const versionDrift = await detectVersionDrift(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions)`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -4292,10 +4477,17 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       ctx.waitUntil(postToMoltBook(env, summary, 'building', ['audit', 'auto-builder']));
     }
 
-    // ═══ DAILY 8 AM UTC: Briefing + Pruning ═══
+    // ═══ DAILY 8 AM UTC: Briefing + Changelog + Pruning ═══
     if (hour === 8 && minute === 0) {
+      const changelog = await generateFleetChangelog(env, cid);
       await generateDailyBriefing(env, cid);
       ctx.waitUntil(pruneStaleData(env, cid));
+
+      // Report changelog to Brain if there are changes
+      if (changelog.entries.length > 0) {
+        const changeText = changelog.entries.map(e => `${e.type}: ${e.worker} (${e.detail})`).join('\n');
+        ctx.waitUntil(reportToBrain(env, `FLEET CHANGELOG (${today()}):\n${changeText}`, 7, ['changelog', 'fleet']));
+      }
     }
 
   } catch (e: any) {
@@ -4519,6 +4711,41 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       service: 'echo-autonomous-builder',
       description: 'Adaptive Cold-Start Warmup — extra warmups for repeat cold-start workers',
       recentAdaptiveWarmups: recent.results
+    }), { headers: corsHeaders });
+  }
+
+  // ─── /changelog ───
+  if (path === '/changelog') {
+    const recent = await env.DB.prepare(
+      `SELECT * FROM actions_log WHERE action_type = 'fleet_changelog' ORDER BY created_at DESC LIMIT 10`
+    ).all();
+    const versions = await env.CACHE.get('fleet_versions', 'json') as Record<string, string> | null;
+    return new Response(JSON.stringify({
+      service: 'echo-autonomous-builder',
+      description: 'Fleet Changelog — daily change tracking across all workers',
+      trackedWorkers: versions ? Object.keys(versions).length : 0,
+      recentChangelogs: recent.results
+    }), { headers: corsHeaders });
+  }
+
+  // ─── /drift ───
+  if (path === '/drift') {
+    const profiles = await env.DB.prepare(
+      `SELECT worker_name, last_version FROM worker_profiles WHERE last_version IS NOT NULL AND last_version != ''`
+    ).all();
+    const groups: Record<string, string[]> = {};
+    for (const w of (profiles.results || []) as any[]) {
+      const ver = (w as any).last_version || 'unknown';
+      if (!groups[ver]) groups[ver] = [];
+      groups[ver].push((w as any).worker_name);
+    }
+    const sorted = Object.entries(groups).sort((a, b) => b[1].length - a[1].length);
+    return new Response(JSON.stringify({
+      service: 'echo-autonomous-builder',
+      description: 'Version Drift Analysis — how scattered are fleet versions',
+      uniqueVersions: Object.keys(groups).length,
+      totalTracked: profiles.results?.length || 0,
+      versionGroups: sorted.map(([ver, workers]) => ({ version: ver, count: workers.length, workers }))
     }), { headers: corsHeaders });
   }
 

@@ -1,5 +1,5 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.18.0 — "SLA Dashboard + Detailed View"
+ * ECHO AUTONOMOUS BUILDER v3.19.0 — "Tiered SLA Thresholds"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
@@ -4978,11 +4978,44 @@ async function detectInfrastructureAnomaly(env: Env, cid: string): Promise<Infra
 }
 
 // ═══════════════════════════════════════════════════
-// MODULE 28: SLA COMPLIANCE MONITOR
-// Computes per-worker SLA compliance (latency + availability) from latency_history.
-// Stores daily snapshots for trend analysis. Flags SLA breaches.
-// SLA tiers: p50<300ms, p90<1000ms, p95<2000ms, p99<5000ms, avail>99.5%
+// MODULE 28: SLA COMPLIANCE MONITOR (v2 — Tiered Thresholds)
+// Workers are categorized into SLA tiers based on their workload profile.
+// Tier 1 (fast): KV-only, simple health endpoints — strictest thresholds
+// Tier 2 (standard): Typical D1 workers — default thresholds
+// Tier 3 (heavy-d1): Complex D1 joins, multi-table queries — relaxed
+// Tier 4 (aggregator): Fan-out to multiple services — most relaxed
 // ═══════════════════════════════════════════════════
+
+type SLATier = { p50: number; p90: number; p95: number; p99: number; availPct: number };
+
+const SLA_TIERS: Record<string, SLATier> = {
+  fast:      { p50: 200,  p90: 500,   p95: 1000,  p99: 3000,  availPct: 99.5 },
+  standard:  { p50: 500,  p90: 1200,  p95: 2500,  p99: 5000,  availPct: 99.0 },
+  heavy:     { p50: 1500, p90: 3000,  p95: 5000,  p99: 8000,  availPct: 95.0 },
+  aggregator:{ p50: 3000, p90: 5000,  p95: 8000,  p99: 12000, availPct: 95.0 },
+};
+
+const WORKER_TIER_MAP: Record<string, string> = {
+  // Tier: fast — simple KV/static workers
+  'echo-doctrine-forge': 'fast', 'echo-qa-tester': 'fast', 'echo-analytics-engine': 'fast',
+  'echo-telegram': 'fast', 'echo-autonomous-daemon': 'fast', 'echo-config-manager': 'fast',
+  'echo-alert-router': 'fast', 'echo-rate-limiter': 'fast', 'echo-cost-optimizer': 'fast',
+  'echo-health-dashboard': 'fast', 'echo-feature-flags': 'fast',
+  // Tier: heavy — complex D1 queries, multi-table
+  'echo-engine-runtime': 'heavy', 'echo-knowledge-forge': 'heavy', 'echo-arcanum': 'heavy',
+  'echo-build-orchestrator': 'heavy', 'echo-coin-rewards': 'heavy', 'echo-recruiting': 'heavy',
+  'echo-darkweb-intelligence': 'heavy', 'echo-call-center': 'heavy',
+  // Tier: aggregator — fan-out to multiple services
+  'echo-shared-brain': 'aggregator', 'echo-sdk-gateway': 'aggregator',
+  'echo-swarm-brain': 'aggregator', 'echo-reddit-bot': 'aggregator',
+  'echo-intel-hub': 'aggregator', 'echo-chat': 'aggregator',
+  // Everything else = standard
+};
+
+function getWorkerSLA(workerName: string): SLATier {
+  const tier = WORKER_TIER_MAP[workerName] || 'standard';
+  return SLA_TIERS[tier] || SLA_TIERS.standard;
+}
 
 interface SLAViolation {
   worker: string;
@@ -5040,7 +5073,6 @@ async function checkSLACompliance(env: Env, cid: string): Promise<SLAResult> {
     }
 
     const pctl = (arr: number[], p: number) => arr.length > 0 ? arr[Math.min(Math.floor(arr.length * p), arr.length - 1)] : 0;
-    const SLA = { p50: 300, p90: 1000, p95: 2000, p99: 5000, availPct: 99.5 };
 
     let fleetTotalChecks = 0, fleetHealthyChecks = 0;
     const allP50s: number[] = [], allP90s: number[] = [], allP95s: number[] = [];
@@ -5053,6 +5085,7 @@ async function checkSLACompliance(env: Env, cid: string): Promise<SLAResult> {
       const wp90 = pctl(lats, 0.90);
       const wp95 = pctl(lats, 0.95);
       const wp99 = pctl(lats, 0.99);
+      const sla = getWorkerSLA(name);
 
       result.checked++;
       fleetTotalChecks += s.total_checks as number;
@@ -5063,24 +5096,24 @@ async function checkSLACompliance(env: Env, cid: string): Promise<SLAResult> {
 
       let workerCompliant = true;
 
-      if (avail < SLA.availPct) {
-        result.violations.push({ worker: name, metric: 'availability', value: Math.round(avail * 100) / 100, threshold: SLA.availPct });
+      if (avail < sla.availPct) {
+        result.violations.push({ worker: name, metric: 'availability', value: Math.round(avail * 100) / 100, threshold: sla.availPct });
         workerCompliant = false;
       }
-      if (wp50 > SLA.p50) {
-        result.violations.push({ worker: name, metric: 'p50', value: wp50, threshold: SLA.p50 });
+      if (wp50 > sla.p50) {
+        result.violations.push({ worker: name, metric: 'p50', value: wp50, threshold: sla.p50 });
         workerCompliant = false;
       }
-      if (wp90 > SLA.p90) {
-        result.violations.push({ worker: name, metric: 'p90', value: wp90, threshold: SLA.p90 });
+      if (wp90 > sla.p90) {
+        result.violations.push({ worker: name, metric: 'p90', value: wp90, threshold: sla.p90 });
         workerCompliant = false;
       }
-      if (wp95 > SLA.p95) {
-        result.violations.push({ worker: name, metric: 'p95', value: wp95, threshold: SLA.p95 });
+      if (wp95 > sla.p95) {
+        result.violations.push({ worker: name, metric: 'p95', value: wp95, threshold: sla.p95 });
         workerCompliant = false;
       }
-      if (wp99 > SLA.p99) {
-        result.violations.push({ worker: name, metric: 'p99', value: wp99, threshold: SLA.p99 });
+      if (wp99 > sla.p99) {
+        result.violations.push({ worker: name, metric: 'p99', value: wp99, threshold: sla.p99 });
         workerCompliant = false;
       }
 
@@ -5664,10 +5697,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     }
     return new Response(JSON.stringify({
       service: 'echo-autonomous-builder',
-      module: 'sla-compliance-monitor',
+      module: 'sla-compliance-monitor-v2',
       current: sla,
       history: snapshots,
-      slaThresholds: { p50: 300, p90: 1000, p95: 2000, p99: 5000, availabilityPct: 99.5 },
+      slaThresholds: SLA_TIERS,
+      workerTiers: WORKER_TIER_MAP,
+      defaultTier: 'standard',
       timestamp: new Date().toISOString(),
     }), { headers: corsHeaders });
   }

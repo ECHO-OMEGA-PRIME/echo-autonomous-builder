@@ -3901,9 +3901,23 @@ async function detectLatencyDegradation(env: Env, cid: string): Promise<{ analyz
       }
     }
 
-    // Alert on degradation
+    // Alert on degradation — but suppress if this is a fleet-wide infrastructure event
     if (degraded.length > 0) {
-      await reportToBrain(env, `LATENCY ALERT: ${degraded.length} workers degraded: ${degraded.join(', ')}. Check for overload or upstream issues.`, 8, ['latency', 'alert', 'degradation']);
+      const degradedPct = analyzed > 0 ? (degraded.length / analyzed) * 100 : 0;
+      if (degradedPct >= 30) {
+        // >30% degraded = infrastructure event. Don't spam individual alerts.
+        // Infrastructure Anomaly Detector (Module 27) handles the alert.
+        await logAction(env.DB, {
+          action_type: 'latency_analysis',
+          target: 'fleet',
+          details: `${degraded.length}/${analyzed} workers degraded (${Math.round(degradedPct)}%). Suppressed individual alerts — infrastructure event. Module 27 will handle.`,
+          result: 'infra_event_suppressed',
+          duration_ms: 0,
+          cycle_id: cid
+        });
+      } else {
+        await reportToBrain(env, `LATENCY ALERT: ${degraded.length} workers degraded: ${degraded.join(', ')}. Check for overload or upstream issues.`, 8, ['latency', 'alert', 'degradation']);
+      }
     }
 
     // Prune old latency data (keep 14 days)

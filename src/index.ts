@@ -4715,7 +4715,7 @@ async function monitorCronHealth(env: Env, cid: string): Promise<{ checked: numb
       if (target.binding === '__SELF__') {
         results.checked++;
         const row = await env.DB.prepare(
-          "SELECT created_at FROM actions_log WHERE action_type IN ('cycle_30min','cycle_4hour','warmup_complete') ORDER BY id DESC LIMIT 1"
+          "SELECT created_at FROM actions_log WHERE action_type IN ('cycle_30min','cycle_4hour','warmup') ORDER BY id DESC LIMIT 1"
         ).first<{ created_at: string }>();
         if (row?.created_at) {
           const lastRun = new Date(row.created_at + 'Z').getTime();

@@ -3712,12 +3712,27 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 }
 
 // ═══════════════════════════════════════════════════
+// Security Headers
+// ═══════════════════════════════════════════════════
+
+function addSecurityHeaders(response: Response): Response {
+  const headers = new Headers(response.headers);
+  headers.set('X-Content-Type-Options', 'nosniff');
+  headers.set('X-Frame-Options', 'DENY');
+  headers.set('X-XSS-Protection', '1; mode=block');
+  headers.set('Strict-Transport-Security', 'max-age=63072000; includeSubDomains; preload');
+  headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+}
+
+// ═══════════════════════════════════════════════════
 // MAIN EXPORT
 // ═══════════════════════════════════════════════════
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    return handleRequest(request, env);
+    return addSecurityHeaders(await handleRequest(request, env));
   },
 
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {

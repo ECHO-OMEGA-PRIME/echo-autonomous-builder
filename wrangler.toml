@@ -307,6 +307,10 @@ binding = "SVC_INTELHUB"
 service = "echo-intel-hub"
 
 [[services]]
+binding = "SVC_DARKWEB"
+service = "echo-darkweb-intelligence"
+
+[[services]]
 binding = "SVC_AIORCHESTRATOR"
 service = "echo-ai-orchestrator"
 

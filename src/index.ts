@@ -148,6 +148,7 @@ const SERVICE_BINDING_MAP: Record<string, string> = {
   'echo-memory-prime': 'SVC_MEMORYPRIME',
   'echo-status-page': 'SVC_STATUSPAGE',
   'echo-intel-hub': 'SVC_INTELHUB',
+  'echo-darkweb-intelligence': 'SVC_DARKWEB',
   'echo-ai-orchestrator': 'SVC_AIORCHESTRATOR',
   // Cold-start repeat offenders (2026-03-28 CC10)
   'echo-customer-success': 'SVC_CUSTOMERSUCCESS',
@@ -302,7 +303,9 @@ const KNOWN_VALID_ROUTES = [
 // Workers that use /status instead of /health as their health endpoint
 // Note: echo-build-orchestrator now has /health (added 2026-03-26)
 const HEALTH_ENDPOINT_OVERRIDES: Record<string, string> = {
-  // Add workers here that only respond to /status, not /health
+  // Workers whose /health does heavy operations (D1 queries) — use lightweight root instead
+  'echo-intel-hub': '/',
+  'echo-darkweb-intelligence': '/',
 };
 
 // Get the correct health check path for a worker
@@ -1085,9 +1088,9 @@ async function markQABugResolved(env: Env, bugId: number, resolution: string): P
 }
 
 async function queueFix(env: Env, fix: { source: string; source_id: string; fix_type: string; target: string; priority: number; details: string }): Promise<void> {
-  // Deduplicate — don't queue the same fix twice
+  // Deduplicate — don't queue the same fix twice (include fixed/failed to prevent re-queue loops)
   const existing = await env.DB.prepare(
-    `SELECT id FROM fix_queue WHERE fix_type = ? AND target = ? AND status IN ('pending', 'in_progress') LIMIT 1`
+    `SELECT id FROM fix_queue WHERE fix_type = ? AND target = ? AND status IN ('pending', 'in_progress', 'fixed', 'failed') LIMIT 1`
   ).bind(fix.fix_type, fix.target).first();
 
   if (existing) return;
@@ -1426,6 +1429,11 @@ async function executeFixQueue(env: Env, cid: string, maxFixes: number = 5): Pro
           `UPDATE fix_queue SET status = 'fixed', fix_applied = 'auto', resolved_at = datetime('now') WHERE id = ?`
         ).bind(fixId).run();
         await incrementStat(env.DB, 'bugs_fixed');
+        // Also mark the source QA bug as resolved to stop re-reporting loop
+        const sourceId = parseInt(fix.source_id as string) || 0;
+        if (sourceId > 0 && fix.source === 'qa') {
+          await markQABugResolved(env, sourceId, `auto-fixed by builder: ${fixType}`);
+        }
       } else {
         // Not fixed but not errored — might need manual intervention
         await env.DB.prepare(

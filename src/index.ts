@@ -1,5 +1,5 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.1.0 — "Evolution Engine + Diagnostics Bridge"
+ * ECHO AUTONOMOUS BUILDER v3.2.0 — "Evolution Engine + Diagnostics Bridge + Latency Monitor"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
@@ -20,6 +20,7 @@
  * 13. Sandbox Tester — tests changes in isolation before promoting to live
  * 14. Autonomous Project Creator — identifies ecosystem gaps, proposes new projects
  * 15. Diagnostics Bridge — fetches diagnostics findings, verifies real vs false positive, auto-resolves
+ * 16. Latency Monitor — records per-worker latency history, detects degradation (2.5x baseline), alerts Brain
  *
  * Cron Schedule:
  * - every 5 min: warm up critical workers + quick health pulse
@@ -406,7 +407,16 @@ async function initDB(db: D1Database): Promise<void> {
     db.prepare(`CREATE TABLE IF NOT EXISTS cron_dedup (
       dedup_key TEXT PRIMARY KEY,
       created_at TEXT DEFAULT (datetime('now'))
-    )`)
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS latency_history (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      worker_name TEXT NOT NULL,
+      latency_ms INTEGER NOT NULL,
+      status_code INTEGER NOT NULL,
+      healthy INTEGER DEFAULT 1,
+      recorded_at TEXT DEFAULT (datetime('now'))
+    )`),
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_latency_worker_time ON latency_history (worker_name, recorded_at)`)
   ]);
 }
 
@@ -564,6 +574,11 @@ async function warmUpWorkers(env: Env, cid: string, workersToWarm: string[] = CR
             worker, result.latencyMs, result.latencyMs, result.latencyMs, result.healthy ? 1 : 0, result.version,
             result.latencyMs, result.latencyMs, result.latencyMs, result.healthy ? 1 : 0, result.version || null
           ).run().catch(() => {});
+
+          // Record latency history for trend analysis (Module 18)
+          env.DB.prepare(
+            `INSERT INTO latency_history (worker_name, latency_ms, status_code, healthy) VALUES (?, ?, ?, ?)`
+          ).bind(worker, result.latencyMs, result.statusCode, result.healthy ? 1 : 0).run().catch(() => {});
 
           return result;
         }
@@ -3452,6 +3467,95 @@ async function bridgeDiagnosticsFindings(env: Env, cid: string): Promise<{ check
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 18: LATENCY DEGRADATION DETECTOR
+// Analyzes latency history to find workers with
+// rising response times (2x+ their normal baseline)
+// ═══════════════════════════════════════════════════
+
+async function detectLatencyDegradation(env: Env, cid: string): Promise<{ analyzed: number; degraded: string[] }> {
+  const degraded: string[] = [];
+  let analyzed = 0;
+
+  try {
+    // Get baseline: average latency per worker over last 7 days
+    const baselines = await env.DB.prepare(`
+      SELECT worker_name,
+             AVG(latency_ms) as avg_latency,
+             COUNT(*) as sample_count
+      FROM latency_history
+      WHERE recorded_at > datetime('now', '-7 days')
+        AND healthy = 1
+      GROUP BY worker_name
+      HAVING sample_count >= 10
+    `).all();
+
+    if (!baselines.results?.length) return { analyzed: 0, degraded: [] };
+
+    for (const baseline of baselines.results) {
+      analyzed++;
+      const workerName = baseline.worker_name as string;
+      const avgLatency = baseline.avg_latency as number;
+
+      // Get recent latency (last 1 hour)
+      const recent = await env.DB.prepare(`
+        SELECT AVG(latency_ms) as recent_avg, COUNT(*) as cnt
+        FROM latency_history
+        WHERE worker_name = ?
+          AND recorded_at > datetime('now', '-1 hour')
+          AND healthy = 1
+      `).bind(workerName).first();
+
+      if (!recent || (recent.cnt as number) < 2) continue;
+
+      const recentAvg = recent.recent_avg as number;
+      const ratio = recentAvg / avgLatency;
+
+      // Degradation threshold: 2.5x baseline and absolute > 3000ms
+      if (ratio > 2.5 && recentAvg > 3000) {
+        degraded.push(workerName);
+        await logAction(env.DB, {
+          action_type: 'latency_degradation',
+          target: workerName,
+          details: `DEGRADED: recent avg ${Math.round(recentAvg)}ms vs baseline ${Math.round(avgLatency)}ms (${ratio.toFixed(1)}x). Last hour: ${recent.cnt} samples.`,
+          result: 'degraded',
+          duration_ms: Math.round(recentAvg),
+          cycle_id: cid
+        });
+      }
+    }
+
+    // Alert on degradation
+    if (degraded.length > 0) {
+      await reportToBrain(env, `LATENCY ALERT: ${degraded.length} workers degraded: ${degraded.join(', ')}. Check for overload or upstream issues.`, 8, ['latency', 'alert', 'degradation']);
+    }
+
+    // Prune old latency data (keep 14 days)
+    env.DB.prepare("DELETE FROM latency_history WHERE recorded_at < datetime('now', '-14 days')").run().catch(() => {});
+
+    await logAction(env.DB, {
+      action_type: 'latency_analysis',
+      target: `${analyzed} workers`,
+      details: `Analyzed ${analyzed} workers with sufficient baseline data. ${degraded.length} degraded.`,
+      result: degraded.length > 0 ? 'degradation_detected' : 'healthy',
+      duration_ms: 0,
+      cycle_id: cid
+    });
+
+  } catch (e: any) {
+    await logAction(env.DB, {
+      action_type: 'latency_analysis_error',
+      target: 'system',
+      details: e.message,
+      result: 'error',
+      duration_ms: 0,
+      cycle_id: cid
+    });
+  }
+
+  return { analyzed, degraded };
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -3525,8 +3629,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const evoFixResult = await executeEvolutionFixes(env, cid);
       const diagResult = await triggerDiagnosticsAgent(env, cid);
       const diagBridge = await bridgeDiagnosticsFindings(env, cid);
+      const latencyCheck = await detectLatencyDegradation(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -3598,8 +3703,34 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         config: '/config',
         evolution: '/evolution/activity',
         diagnosticsBridge: '/diagnostics/bridge',
+        latency: '/latency',
+        latencyDegraded: '/latency/degraded',
       }
     }), { headers: corsHeaders });
+  }
+
+  // ─── /latency ─── Average latency per worker
+  if (path === '/latency') {
+    const data = await env.DB.prepare(`
+      SELECT worker_name,
+             ROUND(AVG(latency_ms)) as avg_ms,
+             MIN(latency_ms) as min_ms,
+             MAX(latency_ms) as max_ms,
+             COUNT(*) as samples,
+             SUM(CASE WHEN healthy = 0 THEN 1 ELSE 0 END) as failures
+      FROM latency_history
+      WHERE recorded_at > datetime('now', '-24 hours')
+      GROUP BY worker_name
+      ORDER BY avg_ms DESC
+    `).all();
+    return new Response(JSON.stringify({ workers: data.results, period: '24h' }), { headers: corsHeaders });
+  }
+
+  // ─── /latency/degraded ─── Currently degraded workers
+  if (path === '/latency/degraded') {
+    const cid = cycleId();
+    const result = await detectLatencyDegradation(env, cid);
+    return new Response(JSON.stringify({ ...result, timestamp: new Date().toISOString() }), { headers: corsHeaders });
   }
 
   // ─── /diagnostics/bridge ───
@@ -3642,7 +3773,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'false_positive_detection', 'low_severity_auto_triage', 'nav_auto_resolve',
         // v3.1 structured logging + root route auto-fix + diagnostics bridge
         'structured_logging_auto_fix', 'root_route_auto_fix',
-        'diagnostics_bridge', 'diagnostics_auto_resolve'
+        'diagnostics_bridge', 'diagnostics_auto_resolve',
+        'latency_monitoring', 'latency_degradation_detection'
       ]
     }), { headers: corsHeaders });
   }

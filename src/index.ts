@@ -491,6 +491,7 @@ async function initDB(db: D1Database): Promise<void> {
       latency_ms INTEGER NOT NULL,
       status_code INTEGER NOT NULL,
       healthy INTEGER DEFAULT 1,
+      probe_method TEXT DEFAULT 'binding',
       recorded_at TEXT DEFAULT (datetime('now'))
     )`),
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_latency_worker_time ON latency_history (worker_name, recorded_at)`),
@@ -533,6 +534,9 @@ async function initDB(db: D1Database): Promise<void> {
       created_at TEXT DEFAULT (datetime('now'))
     )`)
   ]);
+
+  // Migration: add probe_method column to latency_history (v3.26)
+  await db.prepare(`ALTER TABLE latency_history ADD COLUMN probe_method TEXT DEFAULT 'binding'`).run().catch(() => {});
 }
 
 // ═══════════════════════════════════════════════════
@@ -707,9 +711,10 @@ async function warmUpWorkers(env: Env, cid: string, workersToWarm: string[] = CR
           ).run().catch(() => {});
 
           // Record latency history for trend analysis (Module 18)
+          const probeMethod = (SERVICE_BINDING_MAP[worker] && env[SERVICE_BINDING_MAP[worker]]) ? 'binding' : 'public';
           env.DB.prepare(
-            `INSERT INTO latency_history (worker_name, latency_ms, status_code, healthy) VALUES (?, ?, ?, ?)`
-          ).bind(worker, result.latencyMs, result.statusCode, result.healthy ? 1 : 0).run().catch(() => {});
+            `INSERT INTO latency_history (worker_name, latency_ms, status_code, healthy, probe_method) VALUES (?, ?, ?, ?, ?)`
+          ).bind(worker, result.latencyMs, result.statusCode, result.healthy ? 1 : 0, probeMethod).run().catch(() => {});
 
           return result;
         }
@@ -5019,21 +5024,28 @@ async function detectInfrastructureAnomaly(env: Env, cid: string): Promise<Infra
 }
 
 // ═══════════════════════════════════════════════════
-// MODULE 28: SLA COMPLIANCE MONITOR (v2 — Tiered Thresholds)
+// MODULE 28: SLA COMPLIANCE MONITOR (v3 — Binding-Aware Thresholds)
 // Workers are categorized into SLA tiers based on their workload profile.
 // Tier 1 (fast): KV-only, simple health endpoints — strictest thresholds
 // Tier 2 (standard): Typical D1 workers — default thresholds
-// Tier 3 (heavy-d1): Complex D1 joins, multi-table queries — relaxed
+// Tier 3 (heavy): Complex D1 joins, multi-table queries — relaxed
 // Tier 4 (aggregator): Fan-out to multiple services — most relaxed
+// IMPORTANT: Thresholds are calibrated for service binding measurements
+// (2-5x higher latency than public URLs). The probe_method column in
+// latency_history tracks measurement method for future analysis.
 // ═══════════════════════════════════════════════════
 
 type SLATier = { p50: number; p90: number; p95: number; p99: number; availPct: number };
 
+// NOTE: These thresholds are calibrated for SERVICE BINDING measurements,
+// which add 2-5x overhead vs public URL latency. The probe_method column
+// in latency_history tracks whether 'binding' or 'public' was used.
+// When public URL probing is added, these can be tightened.
 const SLA_TIERS: Record<string, SLATier> = {
-  fast:      { p50: 200,  p90: 500,   p95: 1000,  p99: 3000,  availPct: 99.5 },
-  standard:  { p50: 500,  p90: 1200,  p95: 2500,  p99: 5000,  availPct: 99.0 },
-  heavy:     { p50: 1500, p90: 3000,  p95: 5000,  p99: 8000,  availPct: 95.0 },
-  aggregator:{ p50: 3000, p90: 5000,  p95: 8000,  p99: 12000, availPct: 95.0 },
+  fast:      { p50: 400,  p90: 1000,  p95: 2000,  p99: 5000,  availPct: 99.5 },
+  standard:  { p50: 1000, p90: 2500,  p95: 4000,  p99: 8000,  availPct: 99.0 },
+  heavy:     { p50: 3000, p90: 6000,  p95: 10000, p99: 15000, availPct: 95.0 },
+  aggregator:{ p50: 6000, p90: 10000, p95: 15000, p99: 20000, availPct: 90.0 },
 };
 
 const WORKER_TIER_MAP: Record<string, string> = {

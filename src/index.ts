@@ -1,5 +1,5 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.16.0 — "Latency Percentiles Dashboard"
+ * ECHO AUTONOMOUS BUILDER v3.17.0 — "SLA Compliance Monitor"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
@@ -4978,6 +4978,177 @@ async function detectInfrastructureAnomaly(env: Env, cid: string): Promise<Infra
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 28: SLA COMPLIANCE MONITOR
+// Computes per-worker SLA compliance (latency + availability) from latency_history.
+// Stores daily snapshots for trend analysis. Flags SLA breaches.
+// SLA tiers: p50<300ms, p90<1000ms, p95<2000ms, p99<5000ms, avail>99.5%
+// ═══════════════════════════════════════════════════
+
+interface SLAViolation {
+  worker: string;
+  metric: string;
+  value: number;
+  threshold: number;
+}
+
+interface SLAResult {
+  checked: number;
+  compliant: number;
+  violations: SLAViolation[];
+  fleetAvailability: number;
+  fleetP50: number;
+  fleetP90: number;
+  fleetP95: number;
+}
+
+async function checkSLACompliance(env: Env, cid: string): Promise<SLAResult> {
+  const result: SLAResult = {
+    checked: 0, compliant: 0, violations: [],
+    fleetAvailability: 100, fleetP50: 0, fleetP90: 0, fleetP95: 0,
+  };
+
+  try {
+    // Get per-worker latency stats and availability for last 24h
+    const stats = await env.DB.prepare(`
+      SELECT worker_name,
+        COUNT(*) as total_checks,
+        SUM(CASE WHEN healthy = 1 THEN 1 ELSE 0 END) as healthy_checks,
+        AVG(CASE WHEN healthy = 1 THEN latency_ms ELSE NULL END) as avg_lat
+      FROM latency_history
+      WHERE recorded_at > datetime('now', '-24 hours')
+      GROUP BY worker_name
+      HAVING total_checks >= 10
+      ORDER BY worker_name
+    `).all();
+
+    if (!stats.results?.length) return result;
+
+    // Also get sorted latencies per worker for percentile calculation
+    const rawLatencies = await env.DB.prepare(`
+      SELECT worker_name, latency_ms
+      FROM latency_history
+      WHERE recorded_at > datetime('now', '-24 hours') AND healthy = 1
+      ORDER BY worker_name, latency_ms ASC
+    `).all();
+
+    // Group latencies by worker
+    const workerLatencies = new Map<string, number[]>();
+    for (const r of (rawLatencies.results || []) as any[]) {
+      const name = r.worker_name as string;
+      if (!workerLatencies.has(name)) workerLatencies.set(name, []);
+      workerLatencies.get(name)!.push(r.latency_ms as number);
+    }
+
+    const pctl = (arr: number[], p: number) => arr.length > 0 ? arr[Math.min(Math.floor(arr.length * p), arr.length - 1)] : 0;
+    const SLA = { p50: 300, p90: 1000, p95: 2000, p99: 5000, availPct: 99.5 };
+
+    let fleetTotalChecks = 0, fleetHealthyChecks = 0;
+    const allP50s: number[] = [], allP90s: number[] = [], allP95s: number[] = [];
+
+    for (const s of stats.results as any[]) {
+      const name = s.worker_name as string;
+      const avail = (s.healthy_checks / s.total_checks) * 100;
+      const lats = workerLatencies.get(name) || [];
+      const wp50 = pctl(lats, 0.50);
+      const wp90 = pctl(lats, 0.90);
+      const wp95 = pctl(lats, 0.95);
+      const wp99 = pctl(lats, 0.99);
+
+      result.checked++;
+      fleetTotalChecks += s.total_checks as number;
+      fleetHealthyChecks += s.healthy_checks as number;
+      allP50s.push(wp50);
+      allP90s.push(wp90);
+      allP95s.push(wp95);
+
+      let workerCompliant = true;
+
+      if (avail < SLA.availPct) {
+        result.violations.push({ worker: name, metric: 'availability', value: Math.round(avail * 100) / 100, threshold: SLA.availPct });
+        workerCompliant = false;
+      }
+      if (wp50 > SLA.p50) {
+        result.violations.push({ worker: name, metric: 'p50', value: wp50, threshold: SLA.p50 });
+        workerCompliant = false;
+      }
+      if (wp90 > SLA.p90) {
+        result.violations.push({ worker: name, metric: 'p90', value: wp90, threshold: SLA.p90 });
+        workerCompliant = false;
+      }
+      if (wp95 > SLA.p95) {
+        result.violations.push({ worker: name, metric: 'p95', value: wp95, threshold: SLA.p95 });
+        workerCompliant = false;
+      }
+      if (wp99 > SLA.p99) {
+        result.violations.push({ worker: name, metric: 'p99', value: wp99, threshold: SLA.p99 });
+        workerCompliant = false;
+      }
+
+      if (workerCompliant) result.compliant++;
+    }
+
+    result.fleetAvailability = fleetTotalChecks > 0 ? Math.round((fleetHealthyChecks / fleetTotalChecks) * 10000) / 100 : 100;
+    result.fleetP50 = allP50s.length > 0 ? Math.round(allP50s.reduce((a, b) => a + b, 0) / allP50s.length) : 0;
+    result.fleetP90 = allP90s.length > 0 ? Math.round(allP90s.reduce((a, b) => a + b, 0) / allP90s.length) : 0;
+    result.fleetP95 = allP95s.length > 0 ? Math.round(allP95s.reduce((a, b) => a + b, 0) / allP95s.length) : 0;
+
+    // Store daily SLA snapshot
+    const todayStr = today();
+    const existingSnap = await env.CACHE.get(`sla_snapshot_${todayStr}`);
+    if (!existingSnap) {
+      await env.CACHE.put(`sla_snapshot_${todayStr}`, JSON.stringify({
+        date: todayStr,
+        checked: result.checked,
+        compliant: result.compliant,
+        violationCount: result.violations.length,
+        fleetAvailability: result.fleetAvailability,
+        fleetP50: result.fleetP50,
+        fleetP90: result.fleetP90,
+        fleetP95: result.fleetP95,
+        topViolators: result.violations.slice(0, 10).map(v => `${v.worker}:${v.metric}=${v.value}`),
+      }), { expirationTtl: 604800 }); // 7 days
+    }
+
+    const violationPct = result.checked > 0 ? Math.round(((result.checked - result.compliant) / result.checked) * 100) : 0;
+
+    await logAction(env.DB, {
+      action_type: 'sla_compliance_check',
+      target: 'fleet',
+      details: `SLA Check: ${result.compliant}/${result.checked} compliant (${100 - violationPct}%). Fleet avail: ${result.fleetAvailability}%. p50: ${result.fleetP50}ms, p90: ${result.fleetP90}ms, p95: ${result.fleetP95}ms. ${result.violations.length} violations across ${result.checked - result.compliant} workers.`,
+      result: result.violations.length === 0 ? 'pass' : 'warn',
+      duration_ms: 0,
+      cycle_id: cid
+    });
+
+    // Alert Brain if compliance drops below 80%
+    if (violationPct > 20) {
+      const dedupKey = `sla_alert_${todayStr}`;
+      const existing = await env.CACHE.get(dedupKey);
+      if (!existing) {
+        const topViolators = [...new Set(result.violations.map(v => v.worker))].slice(0, 5);
+        await reportToBrain(env,
+          `SLA COMPLIANCE WARNING: Only ${100 - violationPct}% fleet compliant (${result.compliant}/${result.checked}). ` +
+          `Top violators: ${topViolators.join(', ')}. Fleet avail: ${result.fleetAvailability}%.`,
+          8, ['sla', 'compliance', 'alert']);
+        await env.CACHE.put(dedupKey, '1', { expirationTtl: 14400 }); // 4h dedup
+      }
+    }
+
+  } catch (e: any) {
+    await logAction(env.DB, {
+      action_type: 'sla_compliance_error',
+      target: 'fleet',
+      details: e.message,
+      result: 'error',
+      duration_ms: 0,
+      cycle_id: cid
+    });
+  }
+
+  return result;
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -5065,8 +5236,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       // NOTE: monitorCronHealth() already called in 30-min block (which also fires at hour boundaries)
       // Reuse that result — don't double-call and risk duplicate stale alerts
       const infraAnomaly = await detectInfrastructureAnomaly(env, cid);
+      const slaCompliance = await checkSLACompliance(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%)`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -5231,7 +5403,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'adaptive_cold_start_warmup',
         'fleet_changelog_generation', 'version_drift_detection',
         'infrastructure_anomaly_detection', 'on_demand_fleet_report',
-        'rolling_uptime_7day', 'profile_rebaseline', 'kv_cron_alert_dedup'
+        'rolling_uptime_7day', 'profile_rebaseline', 'kv_cron_alert_dedup',
+        'sla_compliance_monitoring', 'latency_percentile_dashboard'
       ]
     }), { headers: corsHeaders });
   }
@@ -5464,9 +5637,39 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       recentDeploys: recentDeploys.results || [],
       recentAlerts: recentAlerts.results || [],
       evolutionScans: evolutionScans.results || [],
+
+      slaCompliance: await (async () => {
+        try {
+          const snap = await env.CACHE.get(`sla_snapshot_${today()}`);
+          return snap ? JSON.parse(snap) : {};
+        } catch { return {}; }
+      })(),
     };
 
     return new Response(JSON.stringify(report), { headers: corsHeaders });
+  }
+
+  // ─── /sla ─── SLA compliance on-demand check
+  if (path === '/sla') {
+    const cid = cycleId();
+    const sla = await checkSLACompliance(env, cid);
+    // Also get last 7 days of snapshots
+    const snapshots: any[] = [];
+    for (let i = 0; i < 7; i++) {
+      const d = new Date();
+      d.setDate(d.getDate() - i);
+      const key = `sla_snapshot_${d.toISOString().split('T')[0]}`;
+      const snap = await env.CACHE.get(key);
+      if (snap) snapshots.push(JSON.parse(snap));
+    }
+    return new Response(JSON.stringify({
+      service: 'echo-autonomous-builder',
+      module: 'sla-compliance-monitor',
+      current: sla,
+      history: snapshots,
+      slaThresholds: { p50: 300, p90: 1000, p95: 2000, p99: 5000, availabilityPct: 99.5 },
+      timestamp: new Date().toISOString(),
+    }), { headers: corsHeaders });
   }
 
   // ─── /cron-health ───
@@ -5676,7 +5879,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       builder: {
         version: env.WORKER_VERSION,
         todayStats: builderStats || {},
-        capabilities: 28,
+        capabilities: 29,
       },
       daemon: {
         version: daemonHealth?.version || 'unknown',
@@ -5900,6 +6103,7 @@ h1{color:#ff6b35;font-size:1.8rem;margin-bottom:4px}
   <div class="card" id="infra-card"><h2>Infrastructure</h2><div id="infra">Loading...</div></div>
   <div class="card" id="cron-card"><h2>Cron Health</h2><div id="crons">Loading...</div></div>
   <div class="card" id="pctile-card"><h2>Latency Percentiles</h2><div id="pctiles">Loading...</div></div>
+  <div class="card" id="sla-card"><h2>SLA Compliance</h2><div id="sla">Loading...</div></div>
   <div class="card" id="latency-card"><h2>Top Latency</h2><div id="latency">Loading...</div></div>
   <div class="card" id="engine-card"><h2>Engine Runtime</h2><div id="engines">Loading...</div></div>
 </div>
@@ -5987,6 +6191,18 @@ async function load(){
         m('p99',lp.p99+'ms',lp.p99<5000?'good':lp.p99<10000?'warn':'bad')+
         m('Max',lp.max+'ms',lp.max<5000?'good':'bad');
     }else{document.getElementById('pctiles').innerHTML='<span style="color:#555">No latency data</span>';}
+    // SLA Compliance
+    const sla=d.slaCompliance||{};
+    if(sla.date){
+      const pct=sla.checked>0?Math.round((sla.compliant/sla.checked)*100):100;
+      document.getElementById('sla').innerHTML=
+        m('Compliance',pct+'%',pct>=95?'good':pct>=80?'warn':'bad')+
+        m('Workers',sla.compliant+'/'+sla.checked+' pass',sla.compliant===sla.checked?'good':'warn')+
+        m('Violations',sla.violationCount||0,sla.violationCount===0?'good':'warn')+
+        m('Fleet Avail',sla.fleetAvailability+'%',sla.fleetAvailability>=99.5?'good':'warn')+
+        m('Fleet p50',sla.fleetP50+'ms',sla.fleetP50<300?'good':'bad')+
+        m('Fleet p90',sla.fleetP90+'ms',sla.fleetP90<1000?'good':'bad');
+    }else{document.getElementById('sla').innerHTML='<span style="color:#555">No SLA data yet (runs every 4h)</span>';}
   }catch(e){
     document.getElementById('error').textContent='Failed to load: '+e.message;
     document.getElementById('error').style.display='block';

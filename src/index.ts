@@ -1,10 +1,10 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.20.0 — "Auto-Blog Writer"
+ * ECHO AUTONOMOUS BUILDER v3.22.0 — "Revenue Pipeline Monitor"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
  *
- * 29 Modules:
+ * 31 Modules:
  * 1. Worker Warmer — keeps critical workers warm, eliminates cold-start latency alerts
  * 2. QA Bug Processor — auto-resolves false positives, queues real fixes
  * 3. Daemon Task Resolver — resolves pending performance tasks
@@ -34,6 +34,8 @@
  * 27. On-Demand Fleet Report — comprehensive /report endpoint for instant fleet status
  * 28. SLA Compliance Monitor — tiered uptime/latency thresholds per worker class
  * 29. Auto-Blog Writer — generates daily SEO blog articles via Engine Runtime + GitHub push
+ * 30. Cross-Worker API Contract Testing — verifies service-to-service API contracts
+ * 31. Revenue Pipeline Monitor — tracks product health, subscriptions, trials, MRR potential
  *
  * Cron Schedule:
  * - every 5 min: warm up critical workers + quick health pulse
@@ -500,6 +502,20 @@ async function initDB(db: D1Database): Promise<void> {
       passed INTEGER DEFAULT 0,
       failed INTEGER DEFAULT 0,
       results_json TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS revenue_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      cycle_id TEXT NOT NULL,
+      products_checked INTEGER DEFAULT 0,
+      products_healthy INTEGER DEFAULT 0,
+      revenue_ready INTEGER DEFAULT 0,
+      potential_mrr INTEGER DEFAULT 0,
+      active_trials INTEGER DEFAULT 0,
+      active_paid INTEGER DEFAULT 0,
+      mrr INTEGER DEFAULT 0,
+      recommendations TEXT,
+      full_report TEXT,
       created_at TEXT DEFAULT (datetime('now'))
     )`)
   ]);
@@ -5565,6 +5581,258 @@ async function runAPIContractTests(env: Env, cid: string): Promise<{
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 31: REVENUE PIPELINE MONITOR
+// Tracks product revenue readiness, subscription status,
+// active trials, and usage signals across the EPT portfolio.
+// Runs every 4 hours. Reports to Shared Brain + D1.
+// ═══════════════════════════════════════════════════
+
+interface RevenueProduct {
+  slug: string;
+  name: string;
+  worker: string;
+  binding?: string;
+  healthPath: string;
+  usagePath?: string;
+  pricingTiers: number;
+  monthlyBase: number; // lowest paid tier $/mo
+}
+
+// Top revenue-ready products with real pricing from ept-api
+const REVENUE_PRODUCTS: RevenueProduct[] = [
+  { slug: 'ai-closer', name: 'AI Sales Agent', worker: 'echo-chat', binding: 'SVC_CHAT', healthPath: '/health', pricingTiers: 3, monthlyBase: 299 },
+  { slug: 'sentinel-ai', name: 'Sentinel AI', worker: 'echo-engine-runtime', binding: 'SVC_ENGINE', healthPath: '/health', pricingTiers: 3, monthlyBase: 99 },
+  { slug: 'crm', name: 'Echo CRM', worker: 'echo-crm', binding: 'SVC_CRM', healthPath: '/health', usagePath: '/pipelines', pricingTiers: 3, monthlyBase: 49 },
+  { slug: 'helpdesk', name: 'Echo Helpdesk', worker: 'echo-helpdesk', binding: 'SVC_HELPDESK', healthPath: '/health', usagePath: '/tenants', pricingTiers: 3, monthlyBase: 39 },
+  { slug: 'call-center', name: 'Echo Call Center', worker: 'echo-call-center', binding: 'SVC_CALLCENTER', healthPath: '/health', pricingTiers: 3, monthlyBase: 99 },
+  { slug: 'booking', name: 'Echo Booking', worker: 'echo-booking', binding: 'SVC_BOOKING', healthPath: '/health', pricingTiers: 3, monthlyBase: 29 },
+  { slug: 'invoice', name: 'Echo Invoice', worker: 'echo-invoice', binding: 'SVC_INVOICE', healthPath: '/health', pricingTiers: 3, monthlyBase: 19 },
+  { slug: 'hr', name: 'Echo HR', worker: 'echo-hr', binding: 'SVC_HR', healthPath: '/health', pricingTiers: 3, monthlyBase: 49 },
+  { slug: 'lms', name: 'Echo LMS', worker: 'echo-lms', binding: 'SVC_LMS', healthPath: '/health', pricingTiers: 3, monthlyBase: 39 },
+  { slug: 'contracts', name: 'Echo Contracts', worker: 'echo-contracts', binding: 'SVC_CONTRACTS', healthPath: '/health', pricingTiers: 3, monthlyBase: 49 },
+  { slug: 'forms', name: 'Echo Forms', worker: 'echo-forms', binding: 'SVC_FORMS', healthPath: '/health', pricingTiers: 3, monthlyBase: 19 },
+  { slug: 'email-marketing', name: 'Echo Email Marketing', worker: 'echo-email-marketing', binding: 'SVC_EMAILMKT', healthPath: '/health', pricingTiers: 3, monthlyBase: 29 },
+  { slug: 'payroll', name: 'Echo Payroll', worker: 'echo-payroll', binding: 'SVC_PAYROLL', healthPath: '/health', pricingTiers: 3, monthlyBase: 79 },
+  { slug: 'inventory', name: 'Echo Inventory', worker: 'echo-inventory', binding: 'SVC_INVENTORY', healthPath: '/health', pricingTiers: 3, monthlyBase: 29 },
+  { slug: 'recruiting', name: 'Echo Recruiting', worker: 'echo-recruiting', binding: 'SVC_RECRUITING', healthPath: '/health', pricingTiers: 3, monthlyBase: 49 },
+  { slug: 'compliance', name: 'Echo Compliance', worker: 'echo-compliance', binding: 'SVC_COMPLIANCE', healthPath: '/health', pricingTiers: 3, monthlyBase: 99 },
+  { slug: 'project-manager', name: 'Echo Project Manager', worker: 'echo-project-manager', binding: 'SVC_PM', healthPath: '/health', pricingTiers: 3, monthlyBase: 29 },
+  { slug: 'live-chat', name: 'Echo Live Chat', worker: 'echo-live-chat', binding: 'SVC_LIVECHAT', healthPath: '/health', pricingTiers: 3, monthlyBase: 29 },
+  { slug: 'finance-ai', name: 'Echo Finance AI', worker: 'echo-finance-ai', binding: 'SVC_FINANCE', healthPath: '/health', pricingTiers: 3, monthlyBase: 39 },
+  { slug: 'social-media', name: 'Echo Social Media', worker: 'echo-social-media', binding: 'SVC_SOCIALMEDIA', healthPath: '/health', pricingTiers: 3, monthlyBase: 29 },
+];
+
+interface ProductHealthStatus {
+  slug: string;
+  name: string;
+  healthy: boolean;
+  latencyMs: number;
+  hasUsage: boolean;
+  usageSignal?: string;
+  revenueReady: boolean;
+  monthlyBase: number;
+  error?: string;
+}
+
+interface SubscriptionSnapshot {
+  totalPlans: number;
+  totalSubscriptions: number;
+  activeTrials: number;
+  activePaid: number;
+  churned: number;
+  trialConversionRate: number;
+  mrr: number; // monthly recurring revenue
+}
+
+interface RevenueReport {
+  timestamp: string;
+  productsChecked: number;
+  productsHealthy: number;
+  productsWithUsage: number;
+  revenueReadyCount: number;
+  potentialMRR: number; // sum of monthlyBase for all healthy products
+  subscriptions: SubscriptionSnapshot;
+  productStatuses: ProductHealthStatus[];
+  recommendations: string[];
+}
+
+async function monitorRevenuePipeline(env: Env, cid: string): Promise<RevenueReport> {
+  const productStatuses: ProductHealthStatus[] = [];
+
+  // Check each revenue product in parallel (batch of 5 to avoid overwhelming)
+  for (let i = 0; i < REVENUE_PRODUCTS.length; i += 5) {
+    const batch = REVENUE_PRODUCTS.slice(i, i + 5);
+    const results = await Promise.allSettled(batch.map(async (product): Promise<ProductHealthStatus> => {
+      const start = Date.now();
+      const binding = product.binding ? (env as any)[product.binding] as Fetcher | undefined : undefined;
+
+      try {
+        let res: Response;
+        if (binding) {
+          res = await binding.fetch(new Request(`https://internal${product.healthPath}`, {
+            headers: { 'User-Agent': 'echo-revenue-monitor' }
+          }));
+        } else {
+          const controller = new AbortController();
+          setTimeout(() => controller.abort(), 8000);
+          res = await fetch(`https://${product.worker}.bmcii1976.workers.dev${product.healthPath}`, {
+            signal: controller.signal,
+            headers: { 'User-Agent': 'echo-revenue-monitor' }
+          });
+        }
+
+        const latencyMs = Date.now() - start;
+        const healthy = res.status === 200;
+
+        // Check for usage signal if available
+        let hasUsage = false;
+        let usageSignal: string | undefined;
+        if (healthy && product.usagePath && binding) {
+          try {
+            const usageRes = await binding.fetch(new Request(`https://internal${product.usagePath}`, {
+              headers: { 'User-Agent': 'echo-revenue-monitor' }
+            }));
+            if (usageRes.status === 200) {
+              const body = await usageRes.text();
+              // Any response with data beyond empty arrays/objects indicates usage
+              if (body.length > 50 && !body.includes('"results":[]') && !body.includes('"data":[]')) {
+                hasUsage = true;
+                usageSignal = `${body.length} bytes response`;
+              }
+            }
+          } catch { /* usage check is best-effort */ }
+        }
+
+        return {
+          slug: product.slug,
+          name: product.name,
+          healthy,
+          latencyMs,
+          hasUsage,
+          usageSignal,
+          revenueReady: healthy && latencyMs < 5000,
+          monthlyBase: product.monthlyBase,
+        };
+      } catch (e: any) {
+        return {
+          slug: product.slug,
+          name: product.name,
+          healthy: false,
+          latencyMs: Date.now() - start,
+          hasUsage: false,
+          revenueReady: false,
+          monthlyBase: product.monthlyBase,
+          error: e.name === 'AbortError' ? 'Timeout' : e.message,
+        };
+      }
+    }));
+
+    for (const r of results) {
+      if (r.status === 'fulfilled') productStatuses.push(r.value);
+    }
+  }
+
+  // Query subscription system
+  let subscriptions: SubscriptionSnapshot = {
+    totalPlans: 0, totalSubscriptions: 0, activeTrials: 0,
+    activePaid: 0, churned: 0, trialConversionRate: 0, mrr: 0,
+  };
+
+  try {
+    const subBinding = (env as any).SVC_SUBSCRIPTION as Fetcher | undefined;
+    if (subBinding) {
+      const plansRes = await subBinding.fetch(new Request('https://internal/plans', {
+        headers: { 'User-Agent': 'echo-revenue-monitor' }
+      }));
+      if (plansRes.status === 200) {
+        const plansData = await plansRes.json() as any;
+        subscriptions.totalPlans = plansData.plans?.length || 0;
+      }
+
+      const subsRes = await subBinding.fetch(new Request('https://internal/subscriptions', {
+        headers: { 'User-Agent': 'echo-revenue-monitor' }
+      }));
+      if (subsRes.status === 200) {
+        const subsData = await subsRes.json() as any;
+        const subs = subsData.subscriptions || [];
+        subscriptions.totalSubscriptions = subs.length;
+        subscriptions.activeTrials = subs.filter((s: any) => s.status === 'trialing').length;
+        subscriptions.activePaid = subs.filter((s: any) => s.status === 'active').length;
+        subscriptions.churned = subs.filter((s: any) => s.status === 'canceled' || s.status === 'expired').length;
+
+        // Calculate MRR from active paid subscriptions
+        // (would need price from plan, for now estimate from status counts)
+        subscriptions.mrr = subscriptions.activePaid * 99; // avg estimate
+
+        // Trial conversion rate
+        const totalTrialEver = subscriptions.activeTrials + subscriptions.activePaid + subscriptions.churned;
+        subscriptions.trialConversionRate = totalTrialEver > 0
+          ? Math.round((subscriptions.activePaid / totalTrialEver) * 100)
+          : 0;
+      }
+    }
+  } catch { /* subscription check is best-effort */ }
+
+  // Generate recommendations
+  const recommendations: string[] = [];
+  const unhealthyProducts = productStatuses.filter(p => !p.healthy);
+  const healthyNoUsage = productStatuses.filter(p => p.healthy && !p.hasUsage);
+  const revenueReady = productStatuses.filter(p => p.revenueReady);
+
+  if (unhealthyProducts.length > 0) {
+    recommendations.push(`FIX: ${unhealthyProducts.length} revenue products are DOWN: ${unhealthyProducts.map(p => p.slug).join(', ')}`);
+  }
+  if (subscriptions.activeTrials > 0 && subscriptions.activePaid === 0) {
+    recommendations.push('CONVERT: Active trials exist but zero paid conversions — review onboarding flow');
+  }
+  if (subscriptions.totalPlans < 3) {
+    recommendations.push('EXPAND: Only ' + subscriptions.totalPlans + ' subscription plans — add tiered pricing for top products');
+  }
+  if (healthyNoUsage.length > 10) {
+    recommendations.push(`MARKET: ${healthyNoUsage.length} products healthy but no usage signals — need marketing/outreach`);
+  }
+  if (revenueReady.length >= 15) {
+    recommendations.push(`STRONG: ${revenueReady.length}/20 products revenue-ready — focus on sales pipeline`);
+  }
+
+  const potentialMRR = revenueReady.reduce((sum, p) => sum + p.monthlyBase, 0);
+
+  const report: RevenueReport = {
+    timestamp: new Date().toISOString(),
+    productsChecked: productStatuses.length,
+    productsHealthy: productStatuses.filter(p => p.healthy).length,
+    productsWithUsage: productStatuses.filter(p => p.hasUsage).length,
+    revenueReadyCount: revenueReady.length,
+    potentialMRR,
+    subscriptions,
+    productStatuses,
+    recommendations,
+  };
+
+  // Store to D1
+  try {
+    await env.DB.prepare(
+      "INSERT INTO revenue_snapshots (cycle_id, products_checked, products_healthy, revenue_ready, potential_mrr, active_trials, active_paid, mrr, recommendations, full_report, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))"
+    ).bind(
+      cid, report.productsChecked, report.productsHealthy, report.revenueReadyCount,
+      report.potentialMRR, subscriptions.activeTrials, subscriptions.activePaid,
+      subscriptions.mrr, JSON.stringify(recommendations), JSON.stringify(report)
+    ).run();
+  } catch { /* table may not exist, will be created by initDB */ }
+
+  await logAction(env.DB, {
+    action_type: 'revenue_monitor',
+    target: 'fleet',
+    details: `Products: ${report.productsHealthy}/${report.productsChecked} healthy | Revenue-ready: ${report.revenueReadyCount} | Potential MRR: $${report.potentialMRR} | Trials: ${subscriptions.activeTrials} | Paid: ${subscriptions.activePaid} | MRR: $${subscriptions.mrr}`,
+    result: unhealthyProducts.length === 0 ? 'success' : 'partial',
+    duration_ms: 0,
+    cycle_id: cid,
+  });
+
+  return report;
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -5654,8 +5922,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const infraAnomaly = await detectInfrastructureAnomaly(env, cid);
       const slaCompliance = await checkSLACompliance(env, cid);
       const contractTests = await runAPIContractTests(env, cid);
+      const revenueReport = await monitorRevenuePipeline(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations | Contracts: ${contractTests.passed}/${contractTests.total} passed`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations | Contracts: ${contractTests.passed}/${contractTests.total} passed | Revenue: ${revenueReport.revenueReadyCount}/${revenueReport.productsChecked} ready, $${revenueReport.potentialMRR} potential MRR, ${revenueReport.subscriptions.activeTrials} trials, ${revenueReport.subscriptions.activePaid} paid`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -5757,6 +6026,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         cronHealth: '/cron-health',
         fleetOverview: '/fleet-overview',
         runBlog: 'POST /run/blog (?force=true to bypass daily dedup)',
+        runRevenue: 'POST /run/revenue',
+        revenue: 'GET /revenue (latest + history)',
         sla: '/sla',
         contractTests: '/contract-tests',
       }
@@ -6453,6 +6724,52 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     }
     const result = await generateAutoBlog(env, cid);
     return new Response(JSON.stringify({ cycleId: cid, ...result }), { headers: corsHeaders });
+  }
+
+  // ─── POST /run/revenue — manually trigger revenue pipeline scan ───
+  if (path === '/run/revenue' && request.method === 'POST') {
+    const cid = cycleId();
+    const report = await monitorRevenuePipeline(env, cid);
+    return new Response(JSON.stringify({ cycleId: cid, ...report }), { headers: corsHeaders });
+  }
+
+  // ─── GET /revenue — revenue pipeline dashboard data ───
+  if (path === '/revenue' && request.method === 'GET') {
+    const limit = parseInt(url.searchParams.get('limit') || '10');
+    try {
+      const snapshots = await env.DB.prepare(
+        `SELECT cycle_id, products_checked, products_healthy, revenue_ready, potential_mrr,
+                active_trials, active_paid, mrr, recommendations, created_at
+         FROM revenue_snapshots ORDER BY created_at DESC LIMIT ?`
+      ).bind(limit).all();
+
+      const latest = snapshots.results?.[0] as any;
+      return new Response(JSON.stringify({
+        ok: true,
+        latest: latest ? {
+          productsChecked: latest.products_checked,
+          productsHealthy: latest.products_healthy,
+          revenueReady: latest.revenue_ready,
+          potentialMRR: latest.potential_mrr,
+          activeTrials: latest.active_trials,
+          activePaid: latest.active_paid,
+          mrr: latest.mrr,
+          recommendations: JSON.parse(latest.recommendations || '[]'),
+          timestamp: latest.created_at,
+        } : null,
+        history: snapshots.results?.map((s: any) => ({
+          cycleId: s.cycle_id,
+          revenueReady: s.revenue_ready,
+          potentialMRR: s.potential_mrr,
+          mrr: s.mrr,
+          activeTrials: s.active_trials,
+          activePaid: s.active_paid,
+          timestamp: s.created_at,
+        })),
+      }), { headers: corsHeaders });
+    } catch {
+      return new Response(JSON.stringify({ ok: true, latest: null, history: [], message: 'No revenue data yet — run POST /run/revenue first' }), { headers: corsHeaders });
+    }
   }
 
   // ─── POST /config ───

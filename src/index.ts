@@ -192,6 +192,8 @@ const FALSE_POSITIVE_PATTERNS = [
   { match: 'missing alt text', reason: 'decorative_images', resolution: 'auto-resolved: decorative/icon images intentionally have empty alt for accessibility' },
   { match: 'console error', reason: 'dev_console_error', resolution: 'auto-resolved: development-mode console errors not present in production build' },
   { match: 'mixed content', reason: 'false_mixed_content', resolution: 'auto-resolved: all assets served via Cloudflare HTTPS edge, mixed content not possible' },
+  { match: 'Thin content', reason: 'csr_thin_content', resolution: 'auto-resolved: React/Next.js CSR page — JS bundle is large but stripped HTML is minimal (content renders client-side)' },
+  { match: 'thin content', reason: 'csr_thin_content_lc', resolution: 'auto-resolved: React/Next.js CSR page — content renders client-side, not in SSR HTML' },
 ];
 
 // EPT website domains for link validation
@@ -3450,6 +3452,21 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       `SELECT * FROM fix_queue WHERE status = ? ORDER BY priority DESC, created_at ASC LIMIT 50`
     ).bind(status).all();
     return new Response(JSON.stringify({ fixes: fixes.results }), { headers: corsHeaders });
+  }
+
+  // ─── /queue/resolve ─── (mark fix_queue items as resolved by CC instances)
+  if (path === '/queue/resolve' && request.method === 'POST') {
+    const body: any = await request.json();
+    const ids: number[] = Array.isArray(body.ids) ? body.ids : (body.id ? [body.id] : []);
+    const reason = body.reason || 'resolved by CC';
+    if (ids.length === 0) {
+      return new Response(JSON.stringify({ error: 'ids or id required' }), { status: 400, headers: corsHeaders });
+    }
+    const placeholders = ids.map(() => '?').join(',');
+    const result = await env.DB.prepare(
+      `UPDATE fix_queue SET status = 'fixed', fix_applied = ?, resolved_at = datetime('now') WHERE id IN (${placeholders}) AND status = 'pending'`
+    ).bind(reason, ...ids).run();
+    return new Response(JSON.stringify({ resolved: true, count: result.meta?.changes || 0, ids, reason }), { headers: corsHeaders });
   }
 
   // ─── /deploys ───

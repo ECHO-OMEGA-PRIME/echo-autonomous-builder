@@ -5979,40 +5979,39 @@ async function auditDoctrineQuality(env: Env, cid: string): Promise<DoctrineQual
       } catch { /* skip domain on error */ }
     }
 
-      // Sort by worst GOLD ratio
-      worstEngines.sort((a, b) => a.goldPct - b.goldPct);
-      report.worstEngines = worstEngines.slice(0, 20);
+    // Sort by worst GOLD ratio
+    worstEngines.sort((a, b) => a.goldPct - b.goldPct);
+    report.worstEngines = worstEngines.slice(0, 20);
 
-      // Estimate GOLD stats from samples
-      const totalSampled = worstEngines.reduce((s, e) => s + e.total, 0);
-      const goldSampled = worstEngines.reduce((s, e) => s + e.gold, 0);
-      report.goldDoctrines = goldSampled;
-      report.goldPct = totalSampled > 0 ? Math.round((goldSampled / totalSampled) * 100) : 0;
+    // Estimate GOLD stats from samples
+    const totalSampled = worstEngines.reduce((s, e) => s + e.total, 0);
+    const goldSampled = worstEngines.reduce((s, e) => s + e.gold, 0);
+    report.goldDoctrines = goldSampled;
+    report.goldPct = totalSampled > 0 ? Math.round((goldSampled / totalSampled) * 100) : 0;
 
-      // Step 4: Trigger Doctrine Forge for engines with 0% GOLD
-      const zeroGoldEngines = worstEngines.filter(e => e.goldPct === 0).slice(0, 3); // Max 3 per cycle
-      for (const eng of zeroGoldEngines) {
-        try {
-          const forgeRes = await forgeBinding.fetch(new Request('https://internal/forge', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'X-Echo-API-Key': env.ECHO_API_KEY || '',
-            },
-            body: JSON.stringify({ engine_id: eng.engine_id, count: 1 }),
-          }));
-          if (forgeRes.ok) {
-            report.forgeTriggered++;
-          } else {
-            report.forgeErrors.push(`${eng.engine_id}: HTTP ${forgeRes.status}`);
-          }
-        } catch (e: any) {
-          report.forgeErrors.push(`${eng.engine_id}: ${e.message}`);
+    // Step 4: Trigger Doctrine Forge for engines with 0% GOLD
+    const zeroGoldEngines = worstEngines.filter(e => e.goldPct === 0).slice(0, 3); // Max 3 per cycle
+    for (const eng of zeroGoldEngines) {
+      try {
+        const forgeRes = await forgeBinding.fetch(new Request('https://internal/forge', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Echo-API-Key': env.ECHO_API_KEY || '',
+          },
+          body: JSON.stringify({ engine_id: eng.engine_id, count: 1 }),
+        }));
+        if (forgeRes.ok) {
+          report.forgeTriggered++;
+        } else {
+          report.forgeErrors.push(`${eng.engine_id}: HTTP ${forgeRes.status}`);
         }
+      } catch (e: any) {
+        report.forgeErrors.push(`${eng.engine_id}: ${e.message}`);
       }
     }
   } catch (e: any) {
-    report.forgeErrors.push(`Engine list error: ${e.message}`);
+    report.forgeErrors.push(`Domain query error: ${e.message}`);
   }
 
   // Step 5: Store audit result
@@ -6074,12 +6073,23 @@ async function auditWorkerSecurity(env: Env, cid: string): Promise<SecurityAudit
   // Select a rotating batch of 10 repos per cycle
   let repos: string[] = [];
   try {
-    const ghRes = await fetch('https://api.github.com/orgs/ECHO-OMEGA-PRIME/repos?per_page=100&sort=pushed&type=sources', {
-      headers: { Authorization: `Bearer ${GH_TOKEN}`, 'User-Agent': 'echo-builder' },
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (ghRes.ok) {
-      const allRepos = (await ghRes.json()) as Array<{ name: string; pushed_at: string }>;
+    // ECHO-OMEGA-PRIME is a user account, not an org — use /users/ endpoint
+    // Fetch multiple pages to get all repos (100 per page)
+    let allRepos: Array<{ name: string; pushed_at: string }> = [];
+    for (let page = 1; page <= 3; page++) {
+      const ghRes = await fetch(`https://api.github.com/users/ECHO-OMEGA-PRIME/repos?per_page=100&sort=pushed&page=${page}`, {
+        headers: { Authorization: `Bearer ${GH_TOKEN}`, 'User-Agent': 'echo-builder' },
+        signal: AbortSignal.timeout(10_000),
+      });
+      if (!ghRes.ok) {
+        report.errors.push(`GitHub API page ${page}: HTTP ${ghRes.status}`);
+        break;
+      }
+      const pageRepos = (await ghRes.json()) as Array<{ name: string; pushed_at: string }>;
+      allRepos = allRepos.concat(pageRepos);
+      if (pageRepos.length < 100) break; // last page
+    }
+    if (allRepos.length > 0) {
       const workerRepos = allRepos.filter(r => r.name.startsWith('echo-') && !r.name.includes('op-com') && !r.name.includes('prime-tech'));
       const batchSize = 10;
       const offset = (Math.floor(Date.now() / (4 * 3600_000)) % Math.max(1, Math.ceil(workerRepos.length / batchSize))) * batchSize;

@@ -4782,14 +4782,20 @@ async function monitorCronHealth(env: Env, cid: string): Promise<{ checked: numb
         const msg = `${target.name}: last run ${Math.round(ageMinutes)}min ago (expected every ${target.expectedIntervalMin}min, threshold ${threshold}min)`;
         results.stale.push(msg);
 
-        await logAction(env.DB, {
-          action_type: 'cron_stale',
-          target: target.name,
-          details: `Cron stale. Last run: ${tsStr} (${Math.round(ageMinutes)}min ago). Expected interval: ${target.expectedIntervalMin}min. Threshold: ${threshold}min.`,
-          result: 'alert',
-          duration_ms: 0,
-          cycle_id: cid
-        });
+        // Dedup: only log alert if no cron_stale for this target in last 60 min
+        const recentAlert = await env.DB.prepare(
+          "SELECT id FROM actions_log WHERE action_type = 'cron_stale' AND target = ? AND created_at > datetime('now', '-60 minutes') LIMIT 1"
+        ).bind(target.name).first();
+        if (!recentAlert) {
+          await logAction(env.DB, {
+            action_type: 'cron_stale',
+            target: target.name,
+            details: `Cron stale. Last run: ${tsStr} (${Math.round(ageMinutes)}min ago). Expected interval: ${target.expectedIntervalMin}min. Threshold: ${threshold}min.`,
+            result: 'alert',
+            duration_ms: 0,
+            cycle_id: cid
+          });
+        }
       } else {
         results.healthy++;
       }
@@ -4799,9 +4805,14 @@ async function monitorCronHealth(env: Env, cid: string): Promise<{ checked: numb
     }
   }
 
-  // Report stale crons to Brain
+  // Report stale crons to Brain (dedup: max once per hour via KV)
   if (results.stale.length > 0) {
-    await reportToBrain(env, `CRON HEALTH ALERT: ${results.stale.length} stale crons:\n${results.stale.join('\n')}`, 8, ['cron-health', 'alert']).catch(() => {});
+    const brainDedupKey = `cron_brain_alert_${today()}`;
+    const lastBrainAlert = await env.CACHE.get(brainDedupKey);
+    if (!lastBrainAlert) {
+      await reportToBrain(env, `CRON HEALTH ALERT: ${results.stale.length} stale crons:\n${results.stale.join('\n')}`, 8, ['cron-health', 'alert']).catch(() => {});
+      await env.CACHE.put(brainDedupKey, new Date().toISOString(), { expirationTtl: 3600 });
+    }
   }
 
   return results;

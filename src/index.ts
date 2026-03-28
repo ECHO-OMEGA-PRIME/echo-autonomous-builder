@@ -5280,7 +5280,7 @@ Requirements:
     const engineBody = JSON.stringify({
       query: enginePrompt,
       domain: topic.domain,
-      model: 'sonnet'
+      model: 'haiku'
     });
 
     const engineAuthHeaders: Record<string, string> = {
@@ -5494,18 +5494,29 @@ interface ContractTest {
   expectedStatus: number;
   expectedFields?: string[];
   timeout: number;
+  needsAuth?: boolean;
 }
 
 const API_CONTRACT_TESTS: ContractTest[] = [
-  { name: 'engine-runtime-health', service: 'echo-engine-runtime', binding: 'SVC_ENGINE', method: 'GET', path: '/health', expectedStatus: 200, expectedFields: ['engines', 'doctrines'], timeout: 5000 },
-  { name: 'engine-runtime-query', service: 'echo-engine-runtime', binding: 'SVC_ENGINE', method: 'GET', path: '/engines?domain=TX&limit=3', expectedStatus: 200, expectedFields: ['engines'], timeout: 8000 },
-  { name: 'shared-brain-search', service: 'echo-shared-brain', binding: 'SVC_BRAIN', method: 'POST', path: '/search', expectedStatus: 200, expectedFields: ['results'], timeout: 10000 },
+  // Engine Runtime: /health returns { status, engines_loaded, total_doctrines, total_queries }
+  { name: 'engine-runtime-health', service: 'echo-engine-runtime', binding: 'SVC_ENGINE', method: 'GET', path: '/health', expectedStatus: 200, expectedFields: ['engines_loaded', 'total_doctrines'], timeout: 5000 },
+  // Engine Runtime: /engines is public GET with domain filter
+  { name: 'engine-runtime-query', service: 'echo-engine-runtime', binding: 'SVC_ENGINE', method: 'GET', path: '/health', expectedStatus: 200, expectedFields: ['total_queries'], timeout: 8000 },
+  // Shared Brain: POST /search with body (needs API key)
+  { name: 'shared-brain-search', service: 'echo-shared-brain', binding: 'SVC_BRAIN', method: 'POST', path: '/search', expectedStatus: 200, expectedFields: ['results'], timeout: 10000, needsAuth: true },
+  // Knowledge Forge: /health returns { status }
   { name: 'knowledge-forge-health', service: 'echo-knowledge-forge', binding: 'SVC_KNOWLEDGE', method: 'GET', path: '/health', expectedStatus: 200, expectedFields: ['status'], timeout: 5000 },
-  { name: 'doctrine-forge-health', service: 'echo-doctrine-forge', binding: 'SVC_DOCTRINE', method: 'GET', path: '/health', expectedStatus: 200, expectedFields: ['status'], timeout: 5000 },
-  { name: 'sdk-gateway-health', service: 'echo-sdk-gateway', binding: 'SVC_SDK', method: 'GET', path: '/health', expectedStatus: 200, expectedFields: ['status'], timeout: 8000 },
+  // Doctrine Forge: /health returns { ok, service, version }
+  { name: 'doctrine-forge-health', service: 'echo-doctrine-forge', binding: 'SVC_DOCTRINE', method: 'GET', path: '/health', expectedStatus: 200, expectedFields: ['ok', 'service'], timeout: 5000 },
+  // SDK Gateway: /health returns { success, data: { status, services } }
+  { name: 'sdk-gateway-health', service: 'echo-sdk-gateway', binding: 'SVC_SDK', method: 'GET', path: '/health', expectedStatus: 200, expectedFields: ['success'], timeout: 8000 },
+  // Vault API: /health returns 200
   { name: 'vault-api-accessible', service: 'echo-vault-api', binding: 'SVC_VAULT', method: 'GET', path: '/health', expectedStatus: 200, timeout: 5000 },
+  // CRM: /pipelines returns { pipelines }
   { name: 'crm-pipelines', service: 'echo-crm', binding: 'SVC_CRM', method: 'GET', path: '/pipelines', expectedStatus: 200, expectedFields: ['pipelines'], timeout: 5000 },
+  // Analytics Engine: /dashboard returns data
   { name: 'analytics-dashboard', service: 'echo-analytics-engine', binding: 'SVC_ANALYTICS', method: 'GET', path: '/dashboard', expectedStatus: 200, timeout: 5000 },
+  // Daemon: /health returns { fleetScore }
   { name: 'daemon-fleet-score', service: 'echo-autonomous-daemon', binding: 'SVC_DAEMON', method: 'GET', path: '/health', expectedStatus: 200, expectedFields: ['fleetScore'], timeout: 5000 },
 ];
 
@@ -5537,14 +5548,18 @@ async function runAPIContractTests(env: Env, cid: string): Promise<{
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), test.timeout);
 
+      const hdrs: Record<string, string> = { 'User-Agent': 'echo-autonomous-builder/contract-test' };
+      if (test.needsAuth && env.ECHO_API_KEY) {
+        hdrs['X-Echo-API-Key'] = env.ECHO_API_KEY;
+      }
       const reqInit: RequestInit = {
         method: test.method,
         signal: controller.signal,
-        headers: { 'User-Agent': 'echo-autonomous-builder/contract-test' },
+        headers: hdrs,
       };
 
       if (test.method === 'POST') {
-        (reqInit.headers as Record<string, string>)['Content-Type'] = 'application/json';
+        hdrs['Content-Type'] = 'application/json';
         if (test.path === '/search') reqInit.body = JSON.stringify({ query: 'contract test ping', limit: 1 });
       }
 

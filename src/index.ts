@@ -537,6 +537,21 @@ async function initDB(db: D1Database): Promise<void> {
 
   // Migration: add probe_method column to latency_history (v3.26)
   await db.prepare(`ALTER TABLE latency_history ADD COLUMN probe_method TEXT DEFAULT 'binding'`).run().catch(() => {});
+
+  // MODULE 37: Worker Endpoint Catalog (v3.28)
+  await db.prepare(`CREATE TABLE IF NOT EXISTS endpoint_catalog (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    worker_name TEXT NOT NULL,
+    endpoint TEXT NOT NULL,
+    method TEXT DEFAULT 'GET',
+    description TEXT,
+    auth_required INTEGER DEFAULT 0,
+    last_seen TEXT DEFAULT (datetime('now')),
+    last_status INTEGER,
+    last_latency_ms INTEGER,
+    created_at TEXT DEFAULT (datetime('now')),
+    UNIQUE(worker_name, endpoint, method)
+  )`).run().catch(() => {});
 }
 
 // ═══════════════════════════════════════════════════
@@ -6910,6 +6925,143 @@ async function autoRecoverSLAViolations(env: Env, cid: string): Promise<{
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 37: Worker Endpoint Catalog
+// Auto-discovers API endpoints from all fleet Workers
+// by fetching their root endpoint and parsing endpoint lists.
+// Stores in D1. Serves via GET /api-catalog.
+// ═══════════════════════════════════════════════════
+
+interface CatalogEntry {
+  worker: string;
+  endpoint: string;
+  method: string;
+  description: string;
+  authRequired: boolean;
+}
+
+interface CatalogResult {
+  scanned: number;
+  discovered: number;
+  errors: number;
+  newEndpoints: number;
+}
+
+async function catalogWorkerEndpoints(env: Env, cid: string): Promise<CatalogResult> {
+  const result: CatalogResult = { scanned: 0, discovered: 0, errors: 0, newEndpoints: 0 };
+
+  // Gather all worker names from the binding map
+  const workerNames = Object.keys(WORKER_BINDING_MAP);
+
+  // Batch: scan up to 30 workers per cycle to stay within CPU budget
+  const batchSize = 30;
+  const idxStr = await env.CACHE.get('catalog_scan_idx') || '0';
+  let startIdx = parseInt(idxStr, 10) % workerNames.length;
+  const batch = workerNames.slice(startIdx, startIdx + batchSize);
+  if (batch.length < batchSize && startIdx > 0) {
+    batch.push(...workerNames.slice(0, batchSize - batch.length));
+  }
+  await env.CACHE.put('catalog_scan_idx', String((startIdx + batchSize) % workerNames.length), { expirationTtl: 86400 * 30 });
+
+  const entries: CatalogEntry[] = [];
+
+  await Promise.all(batch.map(async (workerName) => {
+    result.scanned++;
+    try {
+      const bindingKey = WORKER_BINDING_MAP[workerName];
+      const binding = (env as any)[bindingKey] as Fetcher | undefined;
+      let resp: Response;
+
+      if (binding) {
+        resp = await binding.fetch('https://internal/', { signal: AbortSignal.timeout(8000) });
+      } else {
+        const url = `https://${workerName}.bmcii1976.workers.dev/`;
+        resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      }
+
+      if (!resp.ok) { result.errors++; return; }
+
+      const text = await resp.text();
+      let data: any;
+      try { data = JSON.parse(text); } catch { result.errors++; return; }
+
+      // Parse endpoints from common patterns
+      const endpoints = data.endpoints || data.routes || data.api || {};
+
+      if (typeof endpoints === 'object' && !Array.isArray(endpoints)) {
+        for (const [key, val] of Object.entries(endpoints)) {
+          const desc = typeof val === 'string' ? val : (typeof val === 'object' && val !== null ? JSON.stringify(val) : key);
+
+          // Parse method from description or default to GET
+          let method = 'GET';
+          let endpoint = key;
+          const methodMatch = String(desc).match(/^(GET|POST|PUT|DELETE|PATCH)\s+/);
+          if (methodMatch) {
+            method = methodMatch[1];
+            endpoint = String(desc).replace(methodMatch[0], '').split(' ')[0] || key;
+          }
+          // If the key looks like an endpoint path
+          if (!endpoint.startsWith('/')) endpoint = `/${endpoint}`;
+          // Clean up: remove query params descriptions
+          endpoint = endpoint.split('?')[0].split(' ')[0];
+          if (endpoint.length > 200) endpoint = endpoint.substring(0, 200);
+
+          entries.push({
+            worker: workerName,
+            endpoint,
+            method,
+            description: String(desc).substring(0, 500),
+            authRequired: /auth|key|token|bearer/i.test(String(desc)),
+          });
+          result.discovered++;
+        }
+      } else if (Array.isArray(endpoints)) {
+        for (const ep of endpoints) {
+          const path = typeof ep === 'string' ? ep : (ep?.path || ep?.endpoint || ep?.url || '');
+          if (!path) continue;
+          entries.push({
+            worker: workerName,
+            endpoint: path.startsWith('/') ? path : `/${path}`,
+            method: ep?.method || 'GET',
+            description: ep?.description || path,
+            authRequired: ep?.auth || false,
+          });
+          result.discovered++;
+        }
+      }
+    } catch {
+      result.errors++;
+    }
+  }));
+
+  // Upsert entries into D1
+  if (entries.length > 0) {
+    const stmt = env.DB.prepare(
+      `INSERT INTO endpoint_catalog (worker_name, endpoint, method, description, auth_required, last_seen)
+       VALUES (?, ?, ?, ?, ?, datetime('now'))
+       ON CONFLICT(worker_name, endpoint, method)
+       DO UPDATE SET description = excluded.description, auth_required = excluded.auth_required, last_seen = datetime('now')`
+    );
+    const batchOps = entries.map(e => stmt.bind(e.worker, e.endpoint, e.method, e.description, e.authRequired ? 1 : 0));
+    // D1 batch limit is 100
+    for (let i = 0; i < batchOps.length; i += 100) {
+      await env.DB.batch(batchOps.slice(i, i + 100));
+    }
+    result.newEndpoints = entries.length;
+  }
+
+  await logAction(env.DB, {
+    action_type: 'endpoint_catalog',
+    target: 'fleet',
+    details: `Scanned ${result.scanned} workers, discovered ${result.discovered} endpoints, ${result.errors} errors, upserted ${result.newEndpoints}`,
+    result: result.errors > result.scanned / 2 ? 'warn' : 'success',
+    duration_ms: 0,
+    cycle_id: cid,
+  });
+
+  return result;
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -7006,8 +7158,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const securityAudit = await auditWorkerSecurity(env, cid);
       const topology = await mapFleetTopology(env, cid);
       const deployRegress4h = await detectDeployRegressions(env, cid);
+      const endpointCatalog = await catalogWorkerEndpoints(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations | Contracts: ${contractTests.passed}/${contractTests.total} passed | Revenue: ${revenueReport.revenueReadyCount}/${revenueReport.productsChecked} ready, $${revenueReport.potentialMRR} potential MRR, ${revenueReport.subscriptions.activeTrials} trials, ${revenueReport.subscriptions.activePaid} paid | DoctrineGOLD: ${doctrineAudit.goldPct}% sample, ${doctrineAudit.forgeTriggered} re-forged | Security: ${securityAudit.scanned} scanned, ${securityAudit.findings.length} findings (${securityAudit.findings.filter(f => f.severity === 'critical').length} critical) | Topology: ${topology.workers} workers, ${topology.edges} edges, ${topology.circularDeps.length} circular, ${topology.criticalNodes[0]?.worker || 'none'} top dependency | DeployRegress: ${deployRegress4h.regressions.length}/${deployRegress4h.checked} regressions`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations | Contracts: ${contractTests.passed}/${contractTests.total} passed | Revenue: ${revenueReport.revenueReadyCount}/${revenueReport.productsChecked} ready, $${revenueReport.potentialMRR} potential MRR, ${revenueReport.subscriptions.activeTrials} trials, ${revenueReport.subscriptions.activePaid} paid | DoctrineGOLD: ${doctrineAudit.goldPct}% sample, ${doctrineAudit.forgeTriggered} re-forged | Security: ${securityAudit.scanned} scanned, ${securityAudit.findings.length} findings (${securityAudit.findings.filter(f => f.severity === 'critical').length} critical) | Topology: ${topology.workers} workers, ${topology.edges} edges, ${topology.circularDeps.length} circular, ${topology.criticalNodes[0]?.worker || 'none'} top dependency | DeployRegress: ${deployRegress4h.regressions.length}/${deployRegress4h.checked} regressions | EndpointCatalog: ${endpointCatalog.discovered} endpoints from ${endpointCatalog.scanned} workers`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -8441,6 +8594,59 @@ setInterval(()=>{countdown--;document.getElementById('timer').textContent='Refre
     }
   }
 
+  // ─── /api-catalog ─── Worker Endpoint Catalog (MODULE 37)
+  if (path === '/api-catalog') {
+    if (request.method === 'POST') {
+      const cid = cycleId();
+      const result = await catalogWorkerEndpoints(env, cid);
+      return new Response(JSON.stringify({ ...result, cycle_id: cid, timestamp: new Date().toISOString() }), { headers: corsHeaders });
+    }
+    // GET — return full catalog
+    const worker = url.searchParams.get('worker');
+    const search = url.searchParams.get('search');
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '500', 10), 2000);
+
+    let query = 'SELECT * FROM endpoint_catalog';
+    const conditions: string[] = [];
+    const binds: string[] = [];
+
+    if (worker) { conditions.push('worker_name = ?'); binds.push(worker); }
+    if (search) { conditions.push('(endpoint LIKE ? OR description LIKE ?)'); binds.push(`%${search}%`, `%${search}%`); }
+
+    if (conditions.length > 0) query += ' WHERE ' + conditions.join(' AND ');
+    query += ' ORDER BY worker_name, endpoint LIMIT ?';
+    binds.push(String(limit));
+
+    const data = await env.DB.prepare(query).bind(...binds).all();
+    const endpoints = data.results || [];
+
+    // Summary stats
+    const uniqueWorkers = new Set(endpoints.map((e: any) => e.worker_name)).size;
+    return new Response(JSON.stringify({
+      endpoints,
+      total: endpoints.length,
+      uniqueWorkers,
+      timestamp: new Date().toISOString()
+    }), { headers: corsHeaders });
+  }
+
+  // ─── /api-catalog/summary ─── Endpoint count per worker
+  if (path === '/api-catalog/summary') {
+    const data = await env.DB.prepare(`
+      SELECT worker_name, COUNT(*) as endpoint_count,
+             MAX(last_seen) as last_scanned,
+             SUM(CASE WHEN auth_required = 1 THEN 1 ELSE 0 END) as auth_endpoints
+      FROM endpoint_catalog
+      GROUP BY worker_name
+      ORDER BY endpoint_count DESC
+    `).all();
+    return new Response(JSON.stringify({
+      workers: data.results || [],
+      total: (data.results || []).reduce((s: number, r: any) => s + r.endpoint_count, 0),
+      timestamp: new Date().toISOString()
+    }), { headers: corsHeaders });
+  }
+
   // ─── 404 ───
   return new Response(JSON.stringify({
     error: 'Not found',
@@ -8453,7 +8659,8 @@ setInterval(()=>{countdown--;document.getElementById('timer').textContent='Refre
       'GET /evolution/changes', 'GET /evolution/sandbox',
       'GET /report', 'GET /infra-anomaly', 'GET /cron-health', 'GET /drift',
       'GET /fleet-overview', 'POST /rebaseline', 'GET /dashboard',
-      'GET /topology', 'POST /topology', 'GET /topology/impact/:worker'
+      'GET /topology', 'POST /topology', 'GET /topology/impact/:worker',
+      'GET /api-catalog', 'POST /api-catalog', 'GET /api-catalog/summary'
     ]
   }), { status: 404, headers: corsHeaders });
 }

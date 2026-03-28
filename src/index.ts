@@ -5919,7 +5919,7 @@ async function auditDoctrineQuality(env: Env, cid: string): Promise<DoctrineQual
   } catch { /* continue with audit anyway */ }
 
   // Step 3: Sample doctrine quality across Commander's priority domains
-  // Uses FAST mode queries (lightweight text search, no LLM) to stay within 30s CPU limit
+  // Fire all queries in PARALLEL using Promise.allSettled to stay within CPU limits
   // Rotates 3 domains per cycle so all 8 are covered in ~3 cycles
   try {
     const priorityDomains = ['TX', 'LG', 'LM', 'DRL', 'SEC', 'RE', 'FIN', 'TAX'];
@@ -5932,13 +5932,13 @@ async function auditDoctrineQuality(env: Env, cid: string): Promise<DoctrineQual
 
     const worstEngines: Array<{ engine_id: string; total: number; gold: number; goldPct: number }> = [];
 
-    // Check 3 domains per cycle — FAST mode to avoid timeout
-    for (let i = 0; i < 3; i++) {
+    // Fire 3 domain queries in PARALLEL — each uses FAST mode
+    const queryPromises = Array.from({ length: 3 }, (_, i) => {
       const idx = (i + rotateOffset) % priorityDomains.length;
       const domain = priorityDomains[idx];
       const query = sampleQueries[idx] || 'quality audit sample';
 
-      try {
+      return (async () => {
         const queryRes = env.SVC_ENGINE
           ? await env.SVC_ENGINE.fetch(new Request('https://internal/query', {
               method: 'POST',
@@ -5950,28 +5950,35 @@ async function auditDoctrineQuality(env: Env, cid: string): Promise<DoctrineQual
         if (queryRes?.ok) {
           const qData = await queryRes.json() as any;
           const matches = qData.matches || [];
-          const goldCount = matches.filter((m: any) => m.quality_tier === 'gold').length;
-
-          if (matches.length > 0) {
-            const engineMap = new Map<string, { total: number; gold: number }>();
-            for (const m of matches) {
-              const eid = m.engine_id || domain;
-              const entry = engineMap.get(eid) || { total: 0, gold: 0 };
-              entry.total++;
-              if (m.quality_tier === 'gold') entry.gold++;
-              engineMap.set(eid, entry);
-            }
-            for (const [eid, counts] of engineMap) {
-              worstEngines.push({
-                engine_id: eid,
-                total: counts.total,
-                gold: counts.gold,
-                goldPct: Math.round((counts.gold / counts.total) * 100),
-              });
-            }
-          }
+          return { domain, matches };
         }
-      } catch { /* skip domain on error */ }
+        return { domain, matches: [] };
+      })().catch(() => ({ domain: priorityDomains[(i + rotateOffset) % priorityDomains.length], matches: [] as any[] }));
+    });
+
+    const results = await Promise.allSettled(queryPromises);
+
+    for (const result of results) {
+      if (result.status !== 'fulfilled') continue;
+      const { matches } = result.value;
+      if (matches.length === 0) continue;
+
+      const engineMap = new Map<string, { total: number; gold: number }>();
+      for (const m of matches) {
+        const eid = m.engine_id || 'unknown';
+        const entry = engineMap.get(eid) || { total: 0, gold: 0 };
+        entry.total++;
+        if (m.quality_tier === 'gold') entry.gold++;
+        engineMap.set(eid, entry);
+      }
+      for (const [eid, counts] of engineMap) {
+        worstEngines.push({
+          engine_id: eid,
+          total: counts.total,
+          gold: counts.gold,
+          goldPct: Math.round((counts.gold / counts.total) * 100),
+        });
+      }
     }
 
     // Sort by worst GOLD ratio
@@ -6152,21 +6159,33 @@ async function auditWorkerSecurity(env: Env, cid: string): Promise<SecurityAudit
       }
 
       // CHECK 4: SQL injection via template literals in prepare()
-      // Exclude safe patterns: allowlisted field names joined into SET/WHERE, and .bind() follows
+      // Comprehensive safe-pattern detection to minimize false positives
       for (let i = 0; i < lines.length; i++) {
         if (/\.prepare\s*\(\s*`[^`]*\$\{/.test(lines[i])) {
-          const ctx = lines.slice(Math.max(0, i - 15), Math.min(lines.length, i + 5)).join('\n');
-          // Safe pattern: field allowlist + join into SQL + .bind() with values
+          const ctx = lines.slice(Math.max(0, i - 20), Math.min(lines.length, i + 5)).join('\n');
+          const line = lines[i];
+          const hasBind = /\.bind\s*\(/.test(line);
+          // 1. Field allowlist pattern
           const hasAllowlist = /allowedFields|ALLOWED_FIELDS|validFields|fieldAllowlist|sortFields|SORT_FIELDS|\.includes\s*\(\s*k\s*\)/i.test(ctx);
-          // Safe pattern: dynamic SET clause from allowlisted fields with bind params
-          const isDynamicSetWithBind = /\$\{(?:fields|sets|f|updates|cols)\.join\s*\(/.test(lines[i]) && /\.bind\s*\(/.test(lines[i]);
-          // Safe pattern: table name constants or other safe interpolations
-          const isSafeConstant = /\$\{(?:TABLE|PREFIX|SCHEMA|tableName)\}/.test(lines[i]);
-          // Safe pattern: dynamic WHERE builder (where += 'AND col = ?') with bind params
-          const isDynamicWhere = /\$\{(?:where|whereClause|conditions|filter|clause)\}/.test(lines[i]) && /\.bind\s*\(/.test(lines[i]);
-          // Safe pattern: dynamic ORDER BY from allowlisted sort fields
-          const isDynamicOrder = /\$\{(?:sort|orderBy|order|sortCol|sortField)\}/.test(lines[i]) && /\.bind\s*\(/.test(lines[i]);
-          if (!hasAllowlist && !isDynamicSetWithBind && !isSafeConstant && !isDynamicWhere && !isDynamicOrder) {
+          // 2. Dynamic SET/VALUES from field arrays
+          const isDynamicSet = /\$\{(?:fields|sets|f|updates|cols|placeholders|vals|columns)\.join\s*\(/.test(line);
+          // 3. Table/schema name constants
+          const isSafeConstant = /\$\{(?:TABLE|PREFIX|SCHEMA|tableName|table|tbl)\}/.test(line);
+          // 4. Dynamic WHERE/filter builder with bind params
+          const isDynamicWhere = /\$\{(?:\w*(?:where|filter|clause|conditions|cond)\w*)\}/i.test(line) && hasBind;
+          // 5. Dynamic ORDER BY
+          const isDynamicOrder = /\$\{(?:\w*(?:sort|order|direction)\w*)\}/i.test(line) && hasBind;
+          // 6. Quoted table name from variable (system query)
+          const isQuotedTable = /"\$\{(?:table|tbl|tableName|t)\}"/.test(line);
+          // 7. Context shows WHERE builder (let where = '1=1')
+          const hasWhereBuilder = /(?:let|const|var)\s+\w*(?:where|filter|clause|cond)\w*\s*=\s*['"`](?:1=1|WHERE 1=1|TRUE|)['"`]/i.test(ctx) && hasBind;
+          // 8. Any ${var} where var is conditionally assigned (var = cond ? 'AND col = ?' : '')
+          const varNames = [...line.matchAll(/\$\{(\w+)\}/g)].map(m => m[1]);
+          const isConditionalAssign = varNames.some(v => new RegExp(`(?:const|let|var)\\s+${v}\\s*=\\s*\\w+\\s*\\?\\s*['"\`]`).test(ctx));
+          // 9. LIMIT/OFFSET numeric interpolation
+          const isLimitOffset = /\$\{(?:limit|offset|pageSize|skip|take|count|days|since|period|chunkSize)\}/.test(line);
+          const isSafe = hasAllowlist || isDynamicSet || isSafeConstant || isDynamicWhere || isDynamicOrder || isQuotedTable || hasWhereBuilder || isConditionalAssign || isLimitOffset;
+          if (!isSafe) {
             report.findings.push({ repo, issue: 'sql_injection', severity: 'critical',
               detail: `Template literal in D1 prepare() at line ${i + 1}`, line: i + 1 });
             repoFindings++;

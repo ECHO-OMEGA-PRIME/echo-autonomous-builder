@@ -6737,6 +6737,179 @@ async function detectDeployRegressions(env: Env, cid: string): Promise<{ checked
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 36: AUTO-RECOVERY ENGINE
+// Detects SLA violations and automatically takes corrective action:
+// - Availability drops → burst warmup (3x rapid pings)
+// - Latency spikes → warm + record trending data
+// - Persistent failures → flag for manual review
+// Tracks all recovery attempts in D1 for analysis.
+// ═══════════════════════════════════════════════════
+
+interface RecoveryAttempt {
+  worker: string;
+  violation: string;       // 'availability' | 'p50' | 'p90' | 'p95' | 'p99'
+  pre_value: number;
+  threshold: number;
+  action: string;          // 'burst_warmup' | 'redeploy' | 'escalate'
+  post_value: number | null;
+  success: boolean;
+}
+
+async function autoRecoverSLAViolations(env: Env, cid: string): Promise<{
+  violations: number;
+  attempted: number;
+  recovered: number;
+  escalated: number;
+  attempts: RecoveryAttempt[];
+}> {
+  const result = { violations: 0, attempted: 0, recovered: 0, escalated: 0, attempts: [] as RecoveryAttempt[] };
+
+  try {
+    // Create recovery tracking table
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS auto_recovery_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      cycle_id TEXT NOT NULL,
+      worker_name TEXT NOT NULL,
+      violation_type TEXT NOT NULL,
+      pre_value REAL NOT NULL,
+      threshold REAL NOT NULL,
+      action_taken TEXT NOT NULL,
+      post_value REAL,
+      success INTEGER DEFAULT 0,
+      created_at TEXT DEFAULT (datetime('now'))
+    )`).run();
+
+    // Run fresh SLA check to get current violations
+    const sla = await checkSLACompliance(env, cid);
+    result.violations = sla.violations.length;
+
+    if (sla.violations.length === 0) return result;
+
+    // Dedup: don't recover the same worker more than once per hour
+    const dedupKey = (w: string) => `recovery_dedup_${w}`;
+
+    for (const violation of sla.violations) {
+      const kv = await env.CACHE.get(dedupKey(violation.worker));
+      if (kv) continue; // Already attempted recovery within the hour
+
+      result.attempted++;
+      const binding = SERVICE_BINDING_MAP[violation.worker];
+      const attempt: RecoveryAttempt = {
+        worker: violation.worker,
+        violation: violation.metric,
+        pre_value: violation.value,
+        threshold: violation.threshold,
+        action: 'burst_warmup',
+        post_value: null,
+        success: false,
+      };
+
+      if (violation.metric === 'availability' || violation.metric.startsWith('p')) {
+        // Burst warmup: hit the worker 3 times in rapid succession to force warm state
+        if (binding && (env as any)[binding]) {
+          const burstResults: boolean[] = [];
+          for (let i = 0; i < 3; i++) {
+            try {
+              const start = Date.now();
+              const resp = await (env as any)[binding].fetch(new Request('https://internal/health'));
+              const lat = Date.now() - start;
+              burstResults.push(resp.ok);
+              // Small delay between bursts to let instance stabilize
+              if (i < 2) await new Promise(r => setTimeout(r, 500));
+            } catch {
+              burstResults.push(false);
+            }
+          }
+
+          const successCount = burstResults.filter(Boolean).length;
+          attempt.success = successCount >= 2; // At least 2/3 successful = recovered
+          attempt.post_value = successCount;
+
+          if (attempt.success) {
+            result.recovered++;
+          }
+        } else {
+          // No binding — try public URL warmup
+          try {
+            const publicUrl = `https://${violation.worker}.bmcii1976.workers.dev/health`;
+            for (let i = 0; i < 3; i++) {
+              await fetch(publicUrl, { signal: AbortSignal.timeout(10000) }).catch(() => {});
+              if (i < 2) await new Promise(r => setTimeout(r, 300));
+            }
+            const finalCheck = await fetch(publicUrl, { signal: AbortSignal.timeout(10000) });
+            attempt.success = finalCheck.ok;
+            attempt.post_value = finalCheck.ok ? 1 : 0;
+            if (attempt.success) result.recovered++;
+          } catch {
+            attempt.success = false;
+            attempt.post_value = 0;
+          }
+        }
+
+        // Check if this worker has been failing persistently (>3 recovery attempts in 24h without success)
+        const recentFails = await env.DB.prepare(
+          `SELECT COUNT(*) as cnt FROM auto_recovery_log
+           WHERE worker_name = ? AND success = 0 AND created_at > datetime('now', '-24 hours')`
+        ).bind(violation.worker).first<{ cnt: number }>();
+
+        if ((recentFails?.cnt || 0) >= 3 && !attempt.success) {
+          attempt.action = 'escalate';
+          result.escalated++;
+          // Report persistent failure to brain
+          await reportToBrain(env,
+            `AUTO-RECOVERY ESCALATION: ${violation.worker} has failed ${(recentFails?.cnt || 0) + 1} recovery attempts in 24h. ` +
+            `Violation: ${violation.metric}=${violation.value} (threshold: ${violation.threshold}). Needs manual investigation.`,
+            9, ['auto-recovery', 'escalation', 'alert']
+          ).catch(() => {});
+        }
+      }
+
+      result.attempts.push(attempt);
+
+      // Log to D1
+      await env.DB.prepare(
+        `INSERT INTO auto_recovery_log (cycle_id, worker_name, violation_type, pre_value, threshold, action_taken, post_value, success)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(cid, attempt.worker, attempt.violation, attempt.pre_value, attempt.threshold, attempt.action, attempt.post_value, attempt.success ? 1 : 0).run().catch(() => {});
+
+      // Set dedup: 1 hour cooldown per worker
+      await env.CACHE.put(dedupKey(violation.worker), new Date().toISOString(), { expirationTtl: 3600 });
+    }
+
+    await logAction(env.DB, {
+      action_type: 'auto_recovery',
+      target: `${result.violations} SLA violations`,
+      details: `Attempted: ${result.attempted}, Recovered: ${result.recovered}, Escalated: ${result.escalated}. ` +
+        result.attempts.map(a => `${a.worker}:${a.violation}=${a.pre_value}→${a.action}→${a.success ? 'OK' : 'FAIL'}`).join(', '),
+      result: result.recovered === result.attempted ? 'all_recovered' : result.escalated > 0 ? 'escalated' : 'partial',
+      duration_ms: 0,
+      cycle_id: cid,
+    });
+
+    // Report if any recoveries happened
+    if (result.recovered > 0) {
+      await reportToBrain(env,
+        `AUTO-RECOVERY: ${result.recovered}/${result.attempted} workers recovered from SLA violations. ` +
+        result.attempts.filter(a => a.success).map(a => `${a.worker}:${a.violation}`).join(', '),
+        7, ['auto-recovery', 'success']
+      ).catch(() => {});
+    }
+
+  } catch (e: any) {
+    await logAction(env.DB, {
+      action_type: 'auto_recovery',
+      target: 'system',
+      details: `Error: ${e.message}`,
+      result: 'error',
+      duration_ms: 0,
+      cycle_id: cid,
+    });
+  }
+
+  return result;
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -6779,8 +6952,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const verifyResult = await verifyEndpoints(env, cid);
       const cronHealth = await monitorCronHealth(env, cid);
       const deployRegress = await detectDeployRegressions(env, cid);
+      const autoRecovery = await autoRecoverSLAViolations(env, cid);
 
-      const summary = `Cycle ${cid}: QA processed=${qaResult.processed} autoResolved=${qaResult.autoResolved} queued=${qaResult.queued} | Daemon processed=${daemonResult.processed} resolved=${daemonResult.resolved} | Fixes attempted=${fixResult.attempted} fixed=${fixResult.fixed} failed=${fixResult.failed} | EvoFixes fixed=${evoFixResult.fixed}/${evoFixResult.attempted} failed=${evoFixResult.failed} | Verify: ${verifyResult.verified} checked, ${verifyResult.issues.length} issues | CronHealth: ${cronHealth.healthy}/${cronHealth.checked} healthy, ${cronHealth.stale.length} stale | DeployRegress: ${deployRegress.regressions.length}/${deployRegress.checked} regressions`;
+      const summary = `Cycle ${cid}: QA processed=${qaResult.processed} autoResolved=${qaResult.autoResolved} queued=${qaResult.queued} | Daemon processed=${daemonResult.processed} resolved=${daemonResult.resolved} | Fixes attempted=${fixResult.attempted} fixed=${fixResult.fixed} failed=${fixResult.failed} | EvoFixes fixed=${evoFixResult.fixed}/${evoFixResult.attempted} failed=${evoFixResult.failed} | Verify: ${verifyResult.verified} checked, ${verifyResult.issues.length} issues | CronHealth: ${cronHealth.healthy}/${cronHealth.checked} healthy, ${cronHealth.stale.length} stale | DeployRegress: ${deployRegress.regressions.length}/${deployRegress.checked} regressions | AutoRecovery: ${autoRecovery.recovered}/${autoRecovery.attempted} recovered, ${autoRecovery.escalated} escalated`;
 
       await logAction(env.DB, {
         action_type: 'cycle_30min',
@@ -7817,6 +7991,34 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders });
     }
     return new Response(JSON.stringify({ error: 'id required' }), { status: 400, headers: corsHeaders });
+  }
+
+  // ─── GET /auto-recovery ───
+  if (path === '/auto-recovery' && request.method === 'GET') {
+    try {
+      const limit = parseInt(url.searchParams.get('limit') || '50');
+      const rows = await env.DB.prepare(
+        'SELECT * FROM auto_recovery_log ORDER BY created_at DESC LIMIT ?'
+      ).bind(limit).all();
+      const results = rows.results || [];
+      const summary = {
+        total: results.length,
+        recovered: results.filter((r: any) => r.success === 1).length,
+        failed: results.filter((r: any) => r.success === 0).length,
+        escalated: results.filter((r: any) => r.action_taken === 'escalate').length,
+        uniqueWorkers: [...new Set(results.map((r: any) => r.worker_name))].length,
+      };
+      return new Response(JSON.stringify({ recoveries: results, summary }), { headers: corsHeaders });
+    } catch {
+      return new Response(JSON.stringify({ recoveries: [], summary: { total: 0 } }), { headers: corsHeaders });
+    }
+  }
+
+  // ─── POST /auto-recovery (manual trigger) ───
+  if (path === '/auto-recovery' && request.method === 'POST') {
+    const cid = cycleId();
+    const result = await autoRecoverSLAViolations(env, cid);
+    return new Response(JSON.stringify(result), { headers: corsHeaders });
   }
 
   // ─── POST /config ───

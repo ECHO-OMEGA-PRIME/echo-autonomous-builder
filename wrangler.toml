@@ -182,3 +182,130 @@ service = "echo-workflow-automation"
 [[services]]
 binding = "SVC_FINANCE"
 service = "echo-finance-ai"
+
+# ═══ SaaS product bindings (2026-03-28 CC10) ═══
+# 26 additional SaaS Workers for full fleet warmup coverage
+[[services]]
+binding = "SVC_INVENTORY"
+service = "echo-inventory"
+
+[[services]]
+binding = "SVC_CONTRACTS"
+service = "echo-contracts"
+
+[[services]]
+binding = "SVC_LMS"
+service = "echo-lms"
+
+[[services]]
+binding = "SVC_EMAILMKT"
+service = "echo-email-marketing"
+
+[[services]]
+binding = "SVC_SURVEYS"
+service = "echo-surveys"
+
+[[services]]
+binding = "SVC_KB"
+service = "echo-knowledge-base"
+
+[[services]]
+binding = "SVC_SOCIALMEDIA"
+service = "echo-social-media"
+
+[[services]]
+binding = "SVC_DOCMGR"
+service = "echo-document-manager"
+
+[[services]]
+binding = "SVC_LINKSHORT"
+service = "echo-link-shortener"
+
+[[services]]
+binding = "SVC_FEEDBACK"
+service = "echo-feedback-board"
+
+[[services]]
+binding = "SVC_NEWSLETTER"
+service = "echo-newsletter"
+
+[[services]]
+binding = "SVC_WEBANALYTICS"
+service = "echo-web-analytics"
+
+[[services]]
+binding = "SVC_WAITLIST"
+service = "echo-waitlist"
+
+[[services]]
+binding = "SVC_REVIEWS"
+service = "echo-reviews"
+
+[[services]]
+binding = "SVC_SIGNATURES"
+service = "echo-signatures"
+
+[[services]]
+binding = "SVC_AFFILIATE"
+service = "echo-affiliate"
+
+[[services]]
+binding = "SVC_PROPOSALS"
+service = "echo-proposals"
+
+[[services]]
+binding = "SVC_GAMER"
+service = "echo-gamer-companion"
+
+[[services]]
+binding = "SVC_QRMENU"
+service = "echo-qr-menu"
+
+[[services]]
+binding = "SVC_PODCAST"
+service = "echo-podcast"
+
+[[services]]
+binding = "SVC_COMPLIANCE"
+service = "echo-compliance"
+
+[[services]]
+binding = "SVC_TIMESHEET"
+service = "echo-timesheet"
+
+[[services]]
+binding = "SVC_PAYPAL"
+service = "echo-paypal"
+
+[[services]]
+binding = "SVC_FEATUREFLAGS"
+service = "echo-feature-flags"
+
+[[services]]
+binding = "SVC_EXPENSE"
+service = "echo-expense"
+
+[[services]]
+binding = "SVC_OKR"
+service = "echo-okr"
+
+# ═══ Infrastructure bindings ═══
+[[services]]
+binding = "SVC_INSTAGRAM"
+service = "echo-instagram"
+
+[[services]]
+binding = "SVC_MEMORYPRIME"
+service = "echo-memory-prime"
+
+[[services]]
+binding = "SVC_STATUSPAGE"
+service = "echo-status-page"
+
+[[services]]
+binding = "SVC_INTELHUB"
+service = "echo-intel-hub"
+
+[[services]]
+binding = "SVC_AIORCHESTRATOR"
+service = "echo-ai-orchestrator"

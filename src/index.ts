@@ -5012,7 +5012,7 @@ const WORKER_TIER_MAP: Record<string, string> = {
   'echo-telegram': 'fast', 'echo-autonomous-daemon': 'fast', 'echo-config-manager': 'fast',
   'echo-alert-router': 'fast', 'echo-rate-limiter': 'fast', 'echo-cost-optimizer': 'fast',
   'echo-health-dashboard': 'fast', 'echo-feature-flags': 'fast', 'echo-status-page': 'fast',
-  'echo-email-sender': 'fast', 'echo-link-shortener': 'fast', 'echo-waitlist': 'fast',
+  'echo-link-shortener': 'fast', 'echo-waitlist': 'fast',
   // Tier: standard — typical D1 CRUD, moderate complexity (default for unlisted workers)
   // Tier: heavy — complex D1 queries, multi-table joins, external API calls
   'echo-engine-runtime': 'heavy', 'echo-knowledge-forge': 'heavy', 'echo-arcanum': 'heavy',
@@ -5262,105 +5262,54 @@ async function generateAutoBlog(env: Env, cid: string): Promise<AutoBlogResult> 
   await env.CACHE.put('auto_blog_topic_idx', String((topicIdx + 1) % BLOG_TOPICS.length), { expirationTtl: 86400 * 365 });
 
   try {
-    // Step 1: Query Engine Runtime for domain expertise
-    const enginePrompt = `You are an expert technical blog writer. Write a comprehensive, SEO-optimized blog article about: "${topic.promptTheme}".
-
-Requirements:
-- Title should be compelling and include primary keywords (return it on the FIRST line prefixed with "TITLE: ")
-- Write 800-1200 words of substantive, expert-level content
-- Use markdown formatting with ## headings, bullet points, and bold text
-- Include real-world examples and practical advice
-- Include specific numbers, statistics, or technical details where relevant
-- End with a brief "Key Takeaways" section
-- Write in a professional but accessible tone
-- Do NOT mention any specific company names or products
-- Do NOT include any disclaimers or AI-generated notices
-- Write as a human domain expert would`;
-
-    const engineBody = JSON.stringify({
-      query: enginePrompt,
-      domain: topic.domain,
-      model: 'haiku'
-    });
-
+    // Step 1: Query Engine Runtime for doctrine expertise (fast ~2s, doctrine-based)
     const engineAuthHeaders: Record<string, string> = {
       'Content-Type': 'application/json',
       'X-Echo-API-Key': env.ECHO_API_KEY || 'echo-omega-prime-forge-x-2026'
     };
+    const engineBody = JSON.stringify({ query: topic.promptTheme, domain: topic.domain, limit: 5 });
     const engineResp = env.SVC_ENGINE
-      ? await env.SVC_ENGINE.fetch('https://internal/query/reason', {
-          method: 'POST',
-          headers: engineAuthHeaders,
-          body: engineBody
-        })
-      : await fetchWithTimeout(`${ENGINE_URL}/query/reason`, {
-          method: 'POST',
-          headers: engineAuthHeaders,
-          body: engineBody
-        }, 60000);
+      ? await env.SVC_ENGINE.fetch('https://internal/query', { method: 'POST', headers: engineAuthHeaders, body: engineBody })
+      : await fetchWithTimeout(`${ENGINE_URL}/query`, { method: 'POST', headers: engineAuthHeaders, body: engineBody }, 15000);
 
-    if (!engineResp.ok) {
-      const errBody = await engineResp.text().catch(() => '');
-      return { generated: false, error: `Engine Runtime ${engineResp.status}: ${errBody.slice(0, 100)}` };
+    let doctrines: Array<{ topic: string; conclusion: string }> = [];
+    if (engineResp.ok) {
+      const engineData = await engineResp.json() as any;
+      const results = engineData.doctrines || engineData.results || [];
+      doctrines = results.slice(0, 4).map((d: any) => ({
+        topic: (d.topic || d.title || '').substring(0, 200),
+        conclusion: (d.conclusion || d.answer || d.content || '').substring(0, 800)
+      })).filter((d: any) => d.conclusion.length > 50);
     }
 
-    const engineData = await engineResp.json() as any;
-    const rawContent = engineData.answer || engineData.response || '';
-
-    if (!rawContent || rawContent.length < 200) {
-      return { generated: false, error: 'Engine returned insufficient content' };
-    }
-
-    // Step 2: Parse title and content
-    const lines = rawContent.split('\n');
-    let title = '';
-    let contentStart = 0;
-
-    for (let i = 0; i < Math.min(lines.length, 5); i++) {
-      const line = lines[i].trim();
-      if (line.startsWith('TITLE:')) {
-        title = line.replace(/^TITLE:\s*/, '').replace(/^["#]+\s*/, '').replace(/["]+$/, '').trim();
-        contentStart = i + 1;
-        break;
-      }
-      if (line.startsWith('# ')) {
-        title = line.replace(/^#+\s*/, '').trim();
-        contentStart = i + 1;
-        break;
-      }
-    }
-
-    if (!title) {
-      // Fallback: generate title from theme
-      title = topic.promptTheme
-        .split(' ')
-        .map(w => w.charAt(0).toUpperCase() + w.slice(1))
-        .join(' ');
-    }
-
-    // Clean title: remove quotes, markdown artifacts
-    title = title.replace(/[*_`"]/g, '').trim();
+    // Step 2: Assemble blog from doctrine expertise + template
+    const titlePrefixes = [
+      'The Complete Guide to', 'How to Master', 'Everything You Need to Know About',
+      'A Practical Approach to', 'The Expert Playbook for', 'Why Professionals Are Rethinking',
+      'The Definitive Guide to', 'Inside the World of', 'Key Strategies for',
+      'Breaking Down', 'The Future of', 'What Every Professional Should Know About',
+      'Mastering', 'A Deep Dive Into', 'The Modern Approach to',
+      'Unlocking Value With', 'Building Better Systems for', 'Strategic Thinking About',
+      'The Professional Guide to', 'Optimizing Your Approach to'
+    ];
+    const titleBase = topic.promptTheme.split(' ').map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+    let title = `${titlePrefixes[topicIdx % titlePrefixes.length]} ${titleBase}`;
     if (title.length > 80) title = title.substring(0, 77) + '...';
 
-    // Generate slug from title
-    const slug = title
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .substring(0, 60)
-      + `-${todayStr.replace(/-/g, '')}`;
+    const slug = title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').substring(0, 60) + `-${todayStr.replace(/-/g, '')}`;
 
-    // Extract content body (skip title line)
-    const contentBody = lines.slice(contentStart).join('\n').trim();
+    const introText = `Understanding ${topic.promptTheme} is critical for professionals looking to stay competitive. This article breaks down key frameworks, practical strategies, and expert insights to help you make informed decisions.`;
+    const sectionHeadings = ['Core Framework', 'Strategic Considerations', 'Advanced Analysis', 'Implementation Guide'];
+    let sectionsMarkdown = '';
+    if (doctrines.length > 0) {
+      sectionsMarkdown = doctrines.map((d, i) => `## ${sectionHeadings[i] || 'Expert Insight'}\n\n${d.conclusion}`).join('\n\n');
+    } else {
+      sectionsMarkdown = `## Understanding the Landscape\n\nThe field of ${topic.promptTheme} continues to evolve rapidly. Professionals who invest time in understanding current best practices gain significant competitive advantages.\n\n## Key Considerations\n\nWhen approaching ${topic.promptTheme}, several factors demand attention:\n\n- **Regulatory compliance** — staying current with evolving requirements\n- **Technology adoption** — leveraging automation and AI-powered tools\n- **Risk management** — identifying and mitigating potential issues early\n- **Cost optimization** — balancing thoroughness with efficiency\n- **Documentation** — maintaining clear records supports audit readiness\n\n## Implementation Strategy\n\nSuccessful implementation requires a phased approach: assessment, planning, execution, and continuous monitoring. Each phase builds on the previous one, creating a robust foundation for long-term success.`;
+    }
+    const keyTakeaways = `## Key Takeaways\n\n- Stay informed about the latest developments in ${topic.promptTheme}\n- Leverage technology and automation to improve accuracy and efficiency\n- Build systematic processes rather than relying on ad-hoc approaches\n- Consult domain experts when dealing with complex decisions\n- Review and update your approach regularly as best practices evolve`;
 
-    // Generate excerpt from first paragraph
-    const firstParagraph = contentBody.split('\n\n')[0] || contentBody.substring(0, 200);
-    const excerpt = firstParagraph
-      .replace(/[#*_`\[\]]/g, '')
-      .trim()
-      .substring(0, 160);
-
-    // Estimate read time
+    const contentBody = `${introText}\n\n${sectionsMarkdown}\n\n${keyTakeaways}`;
+    const excerpt = introText.substring(0, 160);
     const wordCount = contentBody.split(/\s+/).length;
     const readTime = `${Math.max(3, Math.ceil(wordCount / 200))} min`;
 

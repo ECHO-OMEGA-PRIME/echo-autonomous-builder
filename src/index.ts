@@ -3367,6 +3367,28 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return new Response(null, { headers: corsHeaders });
   }
 
+  // ─── / (root) ───
+  if (path === '/' || path === '') {
+    return new Response(JSON.stringify({
+      status: 'ok',
+      service: 'echo-autonomous-builder',
+      version: env.WORKER_VERSION || '3.0.0',
+      description: 'The EXECUTION ENGINE for ECHO OMEGA PRIME — autonomous code fixes, deployments, and fleet maintenance',
+      endpoints: {
+        health: '/health',
+        status: '/status',
+        workers: '/workers',
+        queue: '/queue',
+        deploys: '/deploys',
+        history: '/history',
+        stats: '/stats',
+        briefing: '/briefing',
+        config: '/config',
+        evolution: '/evolution/activity',
+      }
+    }), { headers: corsHeaders });
+  }
+
   // ─── /health ───
   if (path === '/health') {
     const stats = await env.DB.prepare(`SELECT * FROM daily_stats WHERE date = ?`).bind(today()).first();

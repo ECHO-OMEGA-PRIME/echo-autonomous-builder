@@ -4546,6 +4546,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         latencyDegraded: '/latency/degraded',
         verify: '/verify',
         adaptive: '/adaptive',
+        changelog: '/changelog',
+        drift: '/drift',
       }
     }), { headers: corsHeaders });
   }
@@ -4618,7 +4620,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'latency_monitoring', 'latency_degradation_detection',
         'dependency_audit', 'fleet_trend_analysis', 'stale_data_pruning',
         'api_endpoint_verification', 'auth_protection_audit', 'error_handling_audit',
-        'adaptive_cold_start_warmup'
+        'adaptive_cold_start_warmup',
+        'fleet_changelog_generation', 'version_drift_detection'
       ]
     }), { headers: corsHeaders });
   }

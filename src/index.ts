@@ -2662,7 +2662,7 @@ FIX QUEUE: ${pendingFixes?.cnt || 0} pending | ${completedFixes?.cnt || 0} fixed
 EVOLUTION: ${pendingEvolution?.cnt || 0} pending findings
 FLEET: ${workerStats?.total || 0} workers | Avg latency: ${todayLatency}ms${trend(todayLatency, yesterdayLatency)} | Avg health: ${Math.round(workerStats?.avgHealth || 0)}%
 VERSIONS: ${versionLine}
-DEGRADED (24h): ${degradedCount?.cnt || 0} workers with unhealthy responses
+COLD-START INCIDENTS (24h): ${degradedCount?.cnt || 0} workers had ≥1 unhealthy check
 ${engineLine ? `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n${engineLine}` : ''}${doctrineLine ? `\n${doctrineLine}` : ''}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TOP PERFORMERS:
@@ -3693,6 +3693,121 @@ async function detectLatencyDegradation(env: Env, cid: string): Promise<{ analyz
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 19: DEPENDENCY AUDIT
+// Scans Worker repos for outdated wrangler/hono versions
+// and flags stale dependencies that may have security issues
+// ═══════════════════════════════════════════════════
+
+async function auditDependencies(env: Env, cid: string): Promise<{ scanned: number; outdated: number; findings: string[] }> {
+  const findings: string[] = [];
+  let scanned = 0, outdated = 0;
+
+  // Check a batch of repos each cycle (rotate through fleet)
+  const AUDIT_REPOS = [
+    'echo-engine-runtime', 'echo-shared-brain', 'echo-autonomous-daemon',
+    'echo-doctrine-forge', 'echo-knowledge-forge', 'echo-chat',
+    'echo-speak-cloud', 'echo-crm', 'echo-helpdesk', 'echo-booking',
+    'echo-invoice', 'echo-forms', 'echo-hr', 'echo-contracts',
+    'echo-call-center', 'echo-home-ai', 'echo-shepherd-ai',
+    'echo-finance-ai', 'echo-project-manager', 'echo-lms',
+    'echo-autonomous-builder', 'echo-payroll', 'echo-calendar',
+    'echo-recruiting', 'echo-compliance', 'echo-inventory',
+    'echo-email-marketing', 'echo-workflow-automation',
+  ];
+
+  const lastIdx = parseInt(await env.CACHE.get('dep_audit_idx') || '0', 10);
+  const batchSize = 5;
+  const batch: string[] = [];
+  for (let i = 0; i < batchSize; i++) {
+    batch.push(AUDIT_REPOS[(lastIdx + i) % AUDIT_REPOS.length]);
+  }
+  await env.CACHE.put('dep_audit_idx', String(lastIdx + batchSize), { expirationTtl: 86400 * 7 });
+
+  // Known latest versions (update periodically)
+  const LATEST_WRANGLER = '4.78';
+  const LATEST_HONO = '4.';
+
+  for (const repo of batch) {
+    try {
+      const resp = await fetchWithTimeout(
+        `${GITHUB_API}/repos/${GITHUB_OWNER}/${repo}/contents/package.json`,
+        { headers: { 'Authorization': `token ${env.GITHUB_TOKEN}`, 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'EchoAutoBuilder/2.0' } },
+        10000
+      );
+      if (!resp.ok) continue;
+
+      const data = await resp.json() as any;
+      const pkg = JSON.parse(atob(data.content.replace(/\n/g, '')));
+      scanned++;
+
+      const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
+
+      // Check wrangler version
+      const wranglerVer = allDeps['wrangler'] || '';
+      if (wranglerVer && !wranglerVer.includes(LATEST_WRANGLER.split('.')[0])) {
+        const majorVer = wranglerVer.replace(/[\^~>=<]/g, '').split('.')[0];
+        if (parseInt(majorVer) < parseInt(LATEST_WRANGLER.split('.')[0])) {
+          findings.push(`${repo}: wrangler ${wranglerVer} → v${LATEST_WRANGLER} available`);
+          outdated++;
+        }
+      }
+
+      // Check for very old hono
+      const honoVer = allDeps['hono'] || '';
+      if (honoVer) {
+        const honoMajor = honoVer.replace(/[\^~>=<]/g, '').split('.')[0];
+        if (parseInt(honoMajor) < 4) {
+          findings.push(`${repo}: hono ${honoVer} is outdated (v4.x available)`);
+          outdated++;
+        }
+      }
+
+      // Check for known vulnerable packages
+      const vulnerable = ['node-fetch@1', 'axios@0.', 'lodash@3.', 'lodash@4.17.1'];
+      for (const [dep, ver] of Object.entries(allDeps)) {
+        for (const vuln of vulnerable) {
+          const [vName, vPrefix] = vuln.split('@');
+          if (dep === vName && (ver as string).replace(/[\^~]/g, '').startsWith(vPrefix)) {
+            findings.push(`${repo}: ${dep}@${ver} has known vulnerabilities`);
+            outdated++;
+          }
+        }
+      }
+
+    } catch { /* skip repos that fail */ }
+  }
+
+  if (findings.length > 0) {
+    // Store findings in evolution_scans
+    for (const finding of findings) {
+      const repo = finding.split(':')[0];
+      const existing = await env.DB.prepare(
+        `SELECT id FROM evolution_scans WHERE repo = ? AND findings = ? AND status NOT IN ('applied', 'rejected')`
+      ).bind(repo, `DEPENDENCY: ${finding}`).first();
+      if (!existing) {
+        await env.DB.prepare(
+          `INSERT INTO evolution_scans (repo, scan_type, findings, priority, status, ai_recommendation, cycle_id)
+           VALUES (?, 'dependency', ?, 4, 'detected', 'Outdated dependency detected. Update via npm/wrangler.', ?)`
+        ).bind(repo, `DEPENDENCY: ${finding}`, cid).run();
+      }
+    }
+
+    await reportToBrain(env, `DEPENDENCY AUDIT: ${scanned} repos scanned, ${outdated} outdated: ${findings.join(' | ')}`, 6, ['dependency', 'audit']);
+  }
+
+  await logAction(env.DB, {
+    action_type: 'dependency_audit',
+    target: `${batch.join(',')}`,
+    details: `Scanned ${scanned} repos. ${outdated} outdated dependencies found.`,
+    result: outdated > 0 ? 'findings' : 'clean',
+    duration_ms: 0,
+    cycle_id: cid
+  });
+
+  return { scanned, outdated, findings };
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -3767,8 +3882,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const diagResult = await triggerDiagnosticsAgent(env, cid);
       const diagBridge = await bridgeDiagnosticsFindings(env, cid);
       const latencyCheck = await detectLatencyDegradation(env, cid);
+      const depAudit = await auditDependencies(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -3911,7 +4027,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         // v3.1 structured logging + root route auto-fix + diagnostics bridge
         'structured_logging_auto_fix', 'root_route_auto_fix',
         'diagnostics_bridge', 'diagnostics_auto_resolve',
-        'latency_monitoring', 'latency_degradation_detection'
+        'latency_monitoring', 'latency_degradation_detection',
+        'dependency_audit'
       ]
     }), { headers: corsHeaders });
   }

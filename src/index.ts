@@ -1,10 +1,10 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.22.0 — "Revenue Pipeline Monitor"
+ * ECHO AUTONOMOUS BUILDER v3.24.0 — "Doctrine Quality Fix"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
  *
- * 31 Modules:
+ * 32 Modules:
  * 1. Worker Warmer — keeps critical workers warm, eliminates cold-start latency alerts
  * 2. QA Bug Processor — auto-resolves false positives, queues real fixes
  * 3. Daemon Task Resolver — resolves pending performance tasks
@@ -36,6 +36,7 @@
  * 29. Auto-Blog Writer — generates daily SEO blog articles via Engine Runtime + GitHub push
  * 30. Cross-Worker API Contract Testing — verifies service-to-service API contracts
  * 31. Revenue Pipeline Monitor — tracks product health, subscriptions, trials, MRR potential
+ * 32. Doctrine Quality Auditor — scans for pre-GOLD doctrines, triggers Forge re-generation
  *
  * Cron Schedule:
  * - every 5 min: warm up critical workers + quick health pulse
@@ -516,6 +517,17 @@ async function initDB(db: D1Database): Promise<void> {
       mrr INTEGER DEFAULT 0,
       recommendations TEXT,
       full_report TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS doctrine_audits (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      cycle_id TEXT NOT NULL,
+      total_doctrines INTEGER DEFAULT 0,
+      gold_doctrines INTEGER DEFAULT 0,
+      gold_pct INTEGER DEFAULT 0,
+      worst_engines TEXT,
+      forge_triggered INTEGER DEFAULT 0,
+      forge_errors TEXT,
       created_at TEXT DEFAULT (datetime('now'))
     )`)
   ]);
@@ -5833,6 +5845,366 @@ async function monitorRevenuePipeline(env: Env, cid: string): Promise<RevenueRep
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 32: DOCTRINE QUALITY AUDITOR
+// Scans Engine Runtime doctrine DB for pre-GOLD quality.
+// Identifies engines with lowest GOLD ratios and triggers
+// Doctrine Forge to regenerate them with GOLD prompts.
+// Runs every 4 hours. Tracks upgrade progress over time.
+// ═══════════════════════════════════════════════════
+
+interface DoctrineQualityReport {
+  totalDoctrines: number;
+  goldDoctrines: number;
+  goldPct: number;
+  deepReasoning: number;
+  shallowReasoning: number;
+  worstEngines: Array<{ engine_id: string; total: number; gold: number; goldPct: number }>;
+  forgeTriggered: number;
+  forgeErrors: string[];
+}
+
+async function auditDoctrineQuality(env: Env, cid: string): Promise<DoctrineQualityReport> {
+  const report: DoctrineQualityReport = {
+    totalDoctrines: 0, goldDoctrines: 0, goldPct: 0,
+    deepReasoning: 0, shallowReasoning: 0,
+    worstEngines: [], forgeTriggered: 0, forgeErrors: [],
+  };
+
+  // Step 1: Get quality overview from Engine Runtime via service binding
+  // We query via the /health endpoint which already has doctrine counts
+  try {
+    const healthRes = env.SVC_ENGINE
+      ? await env.SVC_ENGINE.fetch(new Request('https://internal/health', { headers: { 'User-Agent': 'doctrine-auditor' } }))
+      : await fetch(`${ENGINE_URL}/health`, { headers: { 'User-Agent': 'doctrine-auditor' } });
+
+    if (healthRes.ok) {
+      const data = await healthRes.json() as any;
+      report.totalDoctrines = data.total_doctrines || 0;
+    }
+  } catch { /* best-effort */ }
+
+  // Step 2: Query Doctrine Forge for quality stats
+  // The Forge has direct D1 access to doctrine tables
+  const forgeBinding = (env as any).SVC_DOCTRINE as Fetcher | undefined;
+  if (!forgeBinding) {
+    report.forgeErrors.push('No SVC_DOCTRINE binding');
+    return report;
+  }
+
+  try {
+    // Get forge stats to understand current production rate
+    const statsRes = await forgeBinding.fetch(new Request('https://internal/stats', {
+      headers: { 'User-Agent': 'doctrine-auditor' }
+    }));
+    if (statsRes.ok) {
+      const statsData = await statsRes.json() as any;
+      // Queue status helps us know if engines are already being processed
+      const queue = statsData.queue || [];
+      const pendingInQueue = queue.find((q: any) => q.status === 'pending')?.cnt || 0;
+      const forgingInQueue = queue.find((q: any) => q.status === 'forging')?.cnt || 0;
+
+      // If there are already many pending/forging, don't add more
+      if (pendingInQueue > 50 || forgingInQueue > 5) {
+        await logAction(env.DB, {
+          action_type: 'doctrine_audit',
+          target: 'doctrine_forge',
+          details: `Forge busy: ${pendingInQueue} pending, ${forgingInQueue} forging. Skipping re-queue.`,
+          result: 'skipped',
+          duration_ms: 0,
+          cycle_id: cid,
+        });
+        return report;
+      }
+    }
+  } catch { /* continue with audit anyway */ }
+
+  // Step 3: Sample doctrine quality across Commander's priority domains
+  // Query Engine Runtime directly by domain code — no engine list fetch needed
+  // Each cycle picks a rotating slice of domains to spread coverage
+  try {
+    const priorityDomains = ['TX', 'LG', 'LM', 'DRL', 'SEC', 'RE', 'FIN', 'TAX'];
+    const sampleQueries = [
+      'tax depletion strategy', 'contract analysis breach', 'mineral rights title',
+      'drilling wellbore operations', 'cybersecurity vulnerability', 'real estate lease',
+      'financial reporting compliance', 'tax credit eligibility'
+    ];
+    // Rotate which domains we check each cycle based on time
+    const rotateOffset = Math.floor(Date.now() / 3600000) % priorityDomains.length;
+
+    const worstEngines: Array<{ engine_id: string; total: number; gold: number; goldPct: number }> = [];
+
+    // Check 8 domains per cycle with domain-appropriate queries
+    for (let i = 0; i < Math.min(8, priorityDomains.length); i++) {
+      const idx = (i + rotateOffset) % priorityDomains.length;
+      const domain = priorityDomains[idx];
+      const query = sampleQueries[idx] || 'quality audit sample';
+
+      try {
+        const queryRes = env.SVC_ENGINE
+          ? await env.SVC_ENGINE.fetch(new Request('https://internal/query', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'X-Echo-API-Key': env.ECHO_API_KEY || '' },
+              body: JSON.stringify({ query, domain, limit: 10 }),
+            }))
+          : null;
+
+        if (queryRes?.ok) {
+          const qData = await queryRes.json() as any;
+          const matches = qData.matches || qData.analysis || [];
+          const totalSampled = matches.length;
+          // Engine Runtime now returns quality_tier: "gold" | "standard" based on actual GOLD fields
+          const goldCount = matches.filter((m: any) => m.quality_tier === 'gold').length;
+
+          if (totalSampled > 0) {
+            // Group by engine_id to see per-engine quality
+            const engineMap = new Map<string, { total: number; gold: number }>();
+            for (const m of matches) {
+              const eid = m.engine_id || domain;
+              const entry = engineMap.get(eid) || { total: 0, gold: 0 };
+              entry.total++;
+              if (m.quality_tier === 'gold') entry.gold++;
+              engineMap.set(eid, entry);
+            }
+            for (const [eid, counts] of engineMap) {
+              const goldPct = Math.round((counts.gold / counts.total) * 100);
+              worstEngines.push({
+                engine_id: eid,
+                total: counts.total,
+                gold: counts.gold,
+                goldPct,
+              });
+            }
+          }
+        }
+      } catch { /* skip domain on error */ }
+    }
+
+      // Sort by worst GOLD ratio
+      worstEngines.sort((a, b) => a.goldPct - b.goldPct);
+      report.worstEngines = worstEngines.slice(0, 20);
+
+      // Estimate GOLD stats from samples
+      const totalSampled = worstEngines.reduce((s, e) => s + e.total, 0);
+      const goldSampled = worstEngines.reduce((s, e) => s + e.gold, 0);
+      report.goldDoctrines = goldSampled;
+      report.goldPct = totalSampled > 0 ? Math.round((goldSampled / totalSampled) * 100) : 0;
+
+      // Step 4: Trigger Doctrine Forge for engines with 0% GOLD
+      const zeroGoldEngines = worstEngines.filter(e => e.goldPct === 0).slice(0, 3); // Max 3 per cycle
+      for (const eng of zeroGoldEngines) {
+        try {
+          const forgeRes = await forgeBinding.fetch(new Request('https://internal/forge', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'X-Echo-API-Key': env.ECHO_API_KEY || '',
+            },
+            body: JSON.stringify({ engine_id: eng.engine_id, count: 1 }),
+          }));
+          if (forgeRes.ok) {
+            report.forgeTriggered++;
+          } else {
+            report.forgeErrors.push(`${eng.engine_id}: HTTP ${forgeRes.status}`);
+          }
+        } catch (e: any) {
+          report.forgeErrors.push(`${eng.engine_id}: ${e.message}`);
+        }
+      }
+    }
+  } catch (e: any) {
+    report.forgeErrors.push(`Engine list error: ${e.message}`);
+  }
+
+  // Step 5: Store audit result
+  try {
+    await env.DB.prepare(
+      "INSERT INTO doctrine_audits (cycle_id, total_doctrines, gold_doctrines, gold_pct, worst_engines, forge_triggered, forge_errors, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))"
+    ).bind(
+      cid, report.totalDoctrines, report.goldDoctrines, report.goldPct,
+      JSON.stringify(report.worstEngines), report.forgeTriggered,
+      JSON.stringify(report.forgeErrors)
+    ).run();
+  } catch { /* table may not exist yet */ }
+
+  await logAction(env.DB, {
+    action_type: 'doctrine_quality_audit',
+    target: 'doctrine_forge',
+    details: `Total: ${report.totalDoctrines} | GOLD sample: ${report.goldPct}% | Worst engines: ${report.worstEngines.slice(0, 5).map(e => `${e.engine_id}(${e.goldPct}%)`).join(', ')} | Forge triggered: ${report.forgeTriggered} | Errors: ${report.forgeErrors.length}`,
+    result: report.forgeErrors.length === 0 ? 'success' : 'partial',
+    duration_ms: 0,
+    cycle_id: cid,
+  });
+
+  return report;
+}
+
+// ═══════════════════════════════════════════════════
+// MODULE 33: WORKER SECURITY AUDITOR
+// Scans worker source code from GitHub for security
+// issues: unprotected write endpoints, hardcoded
+// secrets, missing rate limiting, open CORS, etc.
+// Stores findings in security_findings D1 table.
+// Runs every 4 hours. Exposes GET /security-audit.
+// ═══════════════════════════════════════════════════
+
+interface SecurityFinding {
+  repo: string;
+  issue: string;
+  severity: 'critical' | 'high' | 'medium' | 'low';
+  detail: string;
+  line?: number;
+}
+
+interface SecurityAuditReport {
+  scanned: number;
+  findings: SecurityFinding[];
+  clean: number;
+  errors: string[];
+}
+
+async function auditWorkerSecurity(env: Env, cid: string): Promise<SecurityAuditReport> {
+  const report: SecurityAuditReport = { scanned: 0, findings: [], clean: 0, errors: [] };
+
+  const GH_TOKEN = env.GITHUB_TOKEN || '';
+  if (!GH_TOKEN) {
+    report.errors.push('No GITHUB_TOKEN configured');
+    return report;
+  }
+
+  // Select a rotating batch of 10 repos per cycle
+  let repos: string[] = [];
+  try {
+    const ghRes = await fetch('https://api.github.com/orgs/ECHO-OMEGA-PRIME/repos?per_page=100&sort=pushed&type=sources', {
+      headers: { Authorization: `Bearer ${GH_TOKEN}`, 'User-Agent': 'echo-builder' },
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (ghRes.ok) {
+      const allRepos = (await ghRes.json()) as Array<{ name: string; pushed_at: string }>;
+      const workerRepos = allRepos.filter(r => r.name.startsWith('echo-') && !r.name.includes('op-com') && !r.name.includes('prime-tech'));
+      const batchSize = 10;
+      const offset = (Math.floor(Date.now() / (4 * 3600_000)) % Math.max(1, Math.ceil(workerRepos.length / batchSize))) * batchSize;
+      repos = workerRepos.slice(offset, offset + batchSize).map(r => r.name);
+    }
+  } catch (e: any) {
+    report.errors.push(`GitHub list: ${e.message}`);
+    return report;
+  }
+
+  for (const repo of repos) {
+    try {
+      const srcRes = await fetch(`https://api.github.com/repos/ECHO-OMEGA-PRIME/${repo}/contents/src/index.ts`, {
+        headers: { Authorization: `Bearer ${GH_TOKEN}`, Accept: 'application/vnd.github.v3.raw', 'User-Agent': 'echo-builder' },
+        signal: AbortSignal.timeout(8_000),
+      });
+      if (!srcRes.ok) continue;
+
+      const source = await srcRes.text();
+      report.scanned++;
+      let repoFindings = 0;
+      const lines = source.split('\n');
+
+      // CHECK 1: Unprotected write endpoints (POST/PUT/DELETE without auth)
+      const authPattern = /X-Echo-API-Key|Authorization|Bearer|ECHO_API_KEY|auth.*middleware|checkAuth|requireAuth/i;
+      for (let i = 0; i < lines.length; i++) {
+        if (/method\s*===?\s*['"](?:POST|PUT|DELETE|PATCH)['"]/i.test(lines[i])) {
+          const chunk = lines.slice(Math.max(0, i - 10), Math.min(lines.length, i + 30)).join('\n');
+          if (!authPattern.test(chunk)) {
+            report.findings.push({ repo, issue: 'unprotected_write', severity: 'high',
+              detail: `Write endpoint ~line ${i + 1} has no auth check within 30 lines`, line: i + 1 });
+            repoFindings++;
+          }
+        }
+      }
+
+      // CHECK 2: Hardcoded secrets
+      const secretPatterns = [
+        { pattern: /sk_live_[A-Za-z0-9]+/, name: 'stripe_live_key', sev: 'critical' as const },
+        { pattern: /sk-[A-Za-z0-9]{20,}/, name: 'openai_key', sev: 'high' as const },
+        { pattern: /xai-[A-Za-z0-9]{20,}/, name: 'xai_key', sev: 'high' as const },
+        { pattern: /ghp_[A-Za-z0-9]{36}/, name: 'github_pat', sev: 'critical' as const },
+        { pattern: /re_[A-Za-z0-9]{24,}/, name: 'resend_key', sev: 'high' as const },
+      ];
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.trim().startsWith('//') || line.trim().startsWith('*')) continue;
+        for (const sp of secretPatterns) {
+          if (sp.pattern.test(line)) {
+            report.findings.push({ repo, issue: `hardcoded_${sp.name}`, severity: sp.sev,
+              detail: `Potential hardcoded ${sp.name} at line ${i + 1}`, line: i + 1 });
+            repoFindings++;
+            break;
+          }
+        }
+      }
+
+      // CHECK 3: Open CORS (wildcard origin)
+      for (let i = 0; i < lines.length; i++) {
+        if (/['"]Access-Control-Allow-Origin['"]\s*[:,]\s*['"]\*['"]/.test(lines[i])) {
+          report.findings.push({ repo, issue: 'open_cors', severity: 'medium',
+            detail: `Wildcard CORS at line ${i + 1}`, line: i + 1 });
+          repoFindings++;
+        }
+      }
+
+      // CHECK 4: SQL injection via template literals in prepare()
+      for (let i = 0; i < lines.length; i++) {
+        if (/\.prepare\s*\(\s*`[^`]*\$\{/.test(lines[i])) {
+          const ctx = lines.slice(Math.max(0, i - 5), Math.min(lines.length, i + 5)).join('\n');
+          if (!/allowedFields|ALLOWED_FIELDS|validFields|fieldAllowlist|sortFields|SORT_FIELDS/.test(ctx)) {
+            report.findings.push({ repo, issue: 'sql_injection', severity: 'critical',
+              detail: `Template literal in D1 prepare() at line ${i + 1}`, line: i + 1 });
+            repoFindings++;
+          }
+        }
+      }
+
+      // CHECK 5: Missing rate limiting on public endpoints
+      const hasRateLimit = /rate.?limit|RATE_LIMIT|rateLimiter|KV.*rate|increment.*count/i.test(source);
+      if (!hasRateLimit && source.length > 500 && /method\s*===?\s*['"]GET['"]/i.test(source)) {
+        report.findings.push({ repo, issue: 'no_rate_limiting', severity: 'low',
+          detail: 'No rate limiting detected for public endpoints' });
+        repoFindings++;
+      }
+
+      if (repoFindings === 0) report.clean++;
+    } catch (e: any) {
+      report.errors.push(`${repo}: ${e.message}`);
+    }
+  }
+
+  // Store findings
+  try {
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS security_findings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, cycle_id TEXT, repo TEXT, issue TEXT,
+      severity TEXT, detail TEXT, line_number INTEGER, status TEXT DEFAULT 'open',
+      created_at TEXT DEFAULT (datetime('now')), resolved_at TEXT
+    )`).run();
+
+    for (const f of report.findings) {
+      const existing = await env.DB.prepare(
+        "SELECT id FROM security_findings WHERE repo = ? AND issue = ? AND detail = ? AND status = 'open'"
+      ).bind(f.repo, f.issue, f.detail).first();
+      if (!existing) {
+        await env.DB.prepare(
+          "INSERT INTO security_findings (cycle_id, repo, issue, severity, detail, line_number) VALUES (?, ?, ?, ?, ?, ?)"
+        ).bind(cid, f.repo, f.issue, f.severity, f.detail, f.line || null).run();
+      }
+    }
+  } catch { /* table creation race */ }
+
+  await logAction(env.DB, {
+    action_type: 'security_audit',
+    target: `${report.scanned} repos`,
+    details: `Scanned: ${report.scanned} | Findings: ${report.findings.length} (${report.findings.filter(f => f.severity === 'critical').length} critical, ${report.findings.filter(f => f.severity === 'high').length} high) | Clean: ${report.clean} | Errors: ${report.errors.length}`,
+    result: report.findings.filter(f => f.severity === 'critical').length > 0 ? 'critical_findings' : report.findings.length > 0 ? 'findings' : 'clean',
+    duration_ms: 0,
+    cycle_id: cid,
+  });
+
+  return report;
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -5923,8 +6295,10 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const slaCompliance = await checkSLACompliance(env, cid);
       const contractTests = await runAPIContractTests(env, cid);
       const revenueReport = await monitorRevenuePipeline(env, cid);
+      const doctrineAudit = await auditDoctrineQuality(env, cid);
+      const securityAudit = await auditWorkerSecurity(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations | Contracts: ${contractTests.passed}/${contractTests.total} passed | Revenue: ${revenueReport.revenueReadyCount}/${revenueReport.productsChecked} ready, $${revenueReport.potentialMRR} potential MRR, ${revenueReport.subscriptions.activeTrials} trials, ${revenueReport.subscriptions.activePaid} paid`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations | Contracts: ${contractTests.passed}/${contractTests.total} passed | Revenue: ${revenueReport.revenueReadyCount}/${revenueReport.productsChecked} ready, $${revenueReport.potentialMRR} potential MRR, ${revenueReport.subscriptions.activeTrials} trials, ${revenueReport.subscriptions.activePaid} paid | DoctrineGOLD: ${doctrineAudit.goldPct}% sample, ${doctrineAudit.forgeTriggered} re-forged | Security: ${securityAudit.scanned} scanned, ${securityAudit.findings.length} findings (${securityAudit.findings.filter(f => f.severity === 'critical').length} critical)`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -6028,6 +6402,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         runBlog: 'POST /run/blog (?force=true to bypass daily dedup)',
         runRevenue: 'POST /run/revenue',
         revenue: 'GET /revenue (latest + history)',
+        runDoctrineAudit: 'POST /run/doctrine-audit',
+        doctrineQuality: 'GET /doctrine-quality (audit history)',
         sla: '/sla',
         contractTests: '/contract-tests',
       }
@@ -6726,6 +7102,47 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return new Response(JSON.stringify({ cycleId: cid, ...result }), { headers: corsHeaders });
   }
 
+  // ─── POST /run/doctrine-audit — manually trigger doctrine quality audit ───
+  if (path === '/run/doctrine-audit' && request.method === 'POST') {
+    const cid = cycleId();
+    const result = await auditDoctrineQuality(env, cid);
+    return new Response(JSON.stringify({ cycleId: cid, ...result }), { headers: corsHeaders });
+  }
+
+  // ─── GET /doctrine-quality — doctrine quality dashboard data ───
+  if (path === '/doctrine-quality' && request.method === 'GET') {
+    const limit = parseInt(url.searchParams.get('limit') || '10');
+    try {
+      const audits = await env.DB.prepare(
+        `SELECT cycle_id, total_doctrines, gold_doctrines, gold_pct, worst_engines,
+                forge_triggered, forge_errors, created_at
+         FROM doctrine_audits ORDER BY created_at DESC LIMIT ?`
+      ).bind(limit).all();
+
+      const latest = audits.results?.[0] as any;
+      return new Response(JSON.stringify({
+        ok: true,
+        latest: latest ? {
+          totalDoctrines: latest.total_doctrines,
+          goldDoctrines: latest.gold_doctrines,
+          goldPct: latest.gold_pct,
+          worstEngines: JSON.parse(latest.worst_engines || '[]'),
+          forgeTriggered: latest.forge_triggered,
+          forgeErrors: JSON.parse(latest.forge_errors || '[]'),
+          timestamp: latest.created_at,
+        } : null,
+        history: audits.results?.map((a: any) => ({
+          cycleId: a.cycle_id,
+          goldPct: a.gold_pct,
+          forgeTriggered: a.forge_triggered,
+          timestamp: a.created_at,
+        })),
+      }), { headers: corsHeaders });
+    } catch {
+      return new Response(JSON.stringify({ ok: true, latest: null, history: [], message: 'No audit data yet — run POST /run/doctrine-audit first' }), { headers: corsHeaders });
+    }
+  }
+
   // ─── POST /run/revenue — manually trigger revenue pipeline scan ───
   if (path === '/run/revenue' && request.method === 'POST') {
     const cid = cycleId();
@@ -6770,6 +7187,51 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     } catch {
       return new Response(JSON.stringify({ ok: true, latest: null, history: [], message: 'No revenue data yet — run POST /run/revenue first' }), { headers: corsHeaders });
     }
+  }
+
+  // ─── GET /security-audit ───
+  if (path === '/security-audit' && request.method === 'GET') {
+    const limit = parseInt(url.searchParams.get('limit') || '50');
+    const severity = url.searchParams.get('severity') || '';
+    const status = url.searchParams.get('status') || 'open';
+    try {
+      let query = `SELECT * FROM security_findings WHERE status = ?`;
+      const params: any[] = [status];
+      if (severity) {
+        query += ` AND severity = ?`;
+        params.push(severity);
+      }
+      query += ` ORDER BY CASE severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 ELSE 3 END, created_at DESC LIMIT ?`;
+      params.push(limit);
+      const findings = await env.DB.prepare(query).bind(...params).all();
+      const counts = await env.DB.prepare(
+        "SELECT severity, COUNT(*) as count FROM security_findings WHERE status = 'open' GROUP BY severity"
+      ).all();
+      return new Response(JSON.stringify({
+        findings: findings.results || [],
+        counts: Object.fromEntries((counts.results || []).map((r: any) => [r.severity, r.count])),
+        total: findings.results?.length || 0,
+      }), { headers: corsHeaders });
+    } catch {
+      return new Response(JSON.stringify({ findings: [], counts: {}, total: 0, message: 'No security audit data yet' }), { headers: corsHeaders });
+    }
+  }
+
+  // ─── POST /security-audit (manual trigger) ───
+  if (path === '/security-audit' && request.method === 'POST') {
+    const cid = cycleId();
+    const result = await auditWorkerSecurity(env, cid);
+    return new Response(JSON.stringify(result), { headers: corsHeaders });
+  }
+
+  // ─── POST /security-audit/resolve ───
+  if (path === '/security-audit/resolve' && request.method === 'POST') {
+    const body = await request.json().catch(() => ({})) as any;
+    if (body.id) {
+      await env.DB.prepare("UPDATE security_findings SET status = 'resolved', resolved_at = datetime('now') WHERE id = ?").bind(body.id).run();
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders });
+    }
+    return new Response(JSON.stringify({ error: 'id required' }), { status: 400, headers: corsHeaders });
   }
 
   // ─── POST /config ───

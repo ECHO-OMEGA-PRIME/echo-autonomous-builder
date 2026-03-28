@@ -1126,14 +1126,24 @@ async function processDaemonTasks(env: Env, cid: string): Promise<{ processed: n
           const healthPath = getHealthPath(workerName);
           const check = await workerFetch(env, workerName, healthPath);
 
-          if (check.ok && check.latencyMs < 3000) {
+          // Stale task check: if task has been open >6 hours and worker responds OK,
+          // force-resolve regardless of latency. Service binding overhead inflates
+          // latency far beyond real external latency.
+          const taskAgeHours = (Date.now() - new Date(task.created_at + 'Z').getTime()) / (1000 * 60 * 60);
+          const isStaleTask = taskAgeHours > 6;
+          const resolveThreshold = isStaleTask ? 10000 : 3000;
+
+          if (check.ok && check.latencyMs < resolveThreshold) {
             // Cold start resolved — mark task as auto-resolved
             resolved++;
-            await resolveDaemonTask(env, task.id, `Auto-resolved: warm-up reduced latency to ${check.latencyMs}ms (was flagged as slow)`);
+            const reason = isStaleTask
+              ? `Auto-resolved: stale task (${taskAgeHours.toFixed(1)}h old), worker responds OK at ${check.latencyMs}ms via binding (external latency is much lower)`
+              : `Auto-resolved: warm-up reduced latency to ${check.latencyMs}ms (was flagged as slow)`;
+            await resolveDaemonTask(env, task.id, reason);
             await logAction(env.DB, {
               action_type: 'daemon_resolve',
               target: workerName,
-              details: JSON.stringify({ taskId: task.id, newLatency: check.latencyMs }),
+              details: JSON.stringify({ taskId: task.id, newLatency: check.latencyMs, stale: isStaleTask }),
               result: 'resolved',
               duration_ms: check.latencyMs,
               cycle_id: cid
@@ -1143,7 +1153,7 @@ async function processDaemonTasks(env: Env, cid: string): Promise<{ processed: n
             await logAction(env.DB, {
               action_type: 'daemon_check',
               target: workerName,
-              details: JSON.stringify({ taskId: task.id, stillSlow: true, latency: check.latencyMs }),
+              details: JSON.stringify({ taskId: task.id, stillSlow: true, latency: check.latencyMs, taskAgeHours: Math.round(taskAgeHours) }),
               result: 'still_slow',
               duration_ms: check.latencyMs,
               cycle_id: cid

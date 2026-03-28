@@ -309,3 +309,48 @@ service = "echo-intel-hub"
 [[services]]
 binding = "SVC_AIORCHESTRATOR"
 service = "echo-ai-orchestrator"
+
+# ═══ Cold-start repeat offenders (added 2026-03-28 CC10) ═══
+[[services]]
+binding = "SVC_CUSTOMERSUCCESS"
+service = "echo-customer-success"
+
+[[services]]
+binding = "SVC_SUBSCRIPTION"
+service = "echo-subscription"
+
+[[services]]
+binding = "SVC_DATAROOM"
+service = "echo-data-room"
+
+[[services]]
+binding = "SVC_ABTESTING"
+service = "echo-ab-testing-engine"
+
+[[services]]
+binding = "SVC_COINREWARDS"
+service = "echo-coin-rewards"
+
+[[services]]
+binding = "SVC_DOCUMENTS"
+service = "echo-documents"
+
+[[services]]
+binding = "SVC_WORKFLOWS2"
+service = "echo-workflows"
+
+[[services]]
+binding = "SVC_INVOICING"
+service = "echo-invoicing"
+
+[[services]]
+binding = "SVC_APPOINTMENTS"
+service = "echo-appointments"
+
+[[services]]
+binding = "SVC_HRMANAGEMENT"
+service = "echo-hr-management"
+
+[[services]]
+binding = "SVC_PROJECTMANAGEMENT"
+service = "echo-project-management"

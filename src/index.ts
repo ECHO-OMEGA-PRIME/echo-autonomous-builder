@@ -149,6 +149,18 @@ const SERVICE_BINDING_MAP: Record<string, string> = {
   'echo-status-page': 'SVC_STATUSPAGE',
   'echo-intel-hub': 'SVC_INTELHUB',
   'echo-ai-orchestrator': 'SVC_AIORCHESTRATOR',
+  // Cold-start repeat offenders (2026-03-28 CC10)
+  'echo-customer-success': 'SVC_CUSTOMERSUCCESS',
+  'echo-subscription': 'SVC_SUBSCRIPTION',
+  'echo-data-room': 'SVC_DATAROOM',
+  'echo-ab-testing-engine': 'SVC_ABTESTING',
+  'echo-coin-rewards': 'SVC_COINREWARDS',
+  'echo-documents': 'SVC_DOCUMENTS',
+  'echo-workflows': 'SVC_WORKFLOWS2',
+  'echo-invoicing': 'SVC_INVOICING',
+  'echo-appointments': 'SVC_APPOINTMENTS',
+  'echo-hr-management': 'SVC_HRMANAGEMENT',
+  'echo-project-management': 'SVC_PROJECTMANAGEMENT',
 };
 
 interface ActionLog {
@@ -211,7 +223,11 @@ const CRITICAL_WORKERS = [
   'echo-forms', 'echo-project-manager', 'echo-hr',
   'echo-calendar', 'echo-workflow-automation', 'echo-finance-ai',
   // Cold-start repeat offenders — need frequent warming
-  'echo-document-manager'
+  'echo-document-manager',
+  'echo-customer-success', 'echo-subscription', 'echo-data-room',
+  'echo-ab-testing-engine', 'echo-coin-rewards', 'echo-documents',
+  'echo-workflows', 'echo-invoicing', 'echo-appointments',
+  'echo-hr-management', 'echo-project-management'
 ];
 
 // Deduplicated via Set — prevents double-warming the same worker
@@ -239,7 +255,11 @@ const ALL_MONITORED_WORKERS = [...new Set([
   'echo-incident-manager', 'echo-backup-coordinator',
   'echo-diagnostics-agent', 'echo-vendor-manager',
   'echo-messenger', 'echo-whatsapp', 'echo-slack',
-  'echo-memory-prime', 'echo-status-page', 'omniscient-sync'
+  'echo-memory-prime', 'echo-status-page', 'omniscient-sync',
+  'echo-customer-success', 'echo-subscription', 'echo-data-room',
+  'echo-ab-testing-engine', 'echo-coin-rewards', 'echo-documents',
+  'echo-workflows', 'echo-invoicing', 'echo-appointments',
+  'echo-hr-management', 'echo-project-management'
 ])];
 
 const KNOWN_REDIRECT_PAGES = [

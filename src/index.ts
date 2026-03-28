@@ -1,5 +1,5 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.14.0 — "Visual Dashboard"
+ * ECHO AUTONOMOUS BUILDER v3.15.0 — "Report: Engine Runtime + Doctrine Forge Data"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
@@ -5330,6 +5330,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       recentDeploys,
       recentAlerts,
       daemonHealth,
+      engineRuntimeHealth,
+      doctrineForgeStats,
     ] = await Promise.all([
       env.DB.prepare(`SELECT * FROM daily_stats WHERE date = ?`).bind(today()).first(),
       env.DB.prepare(`SELECT worker_name, avg_latency_ms, health_score, check_count, healthy_count, last_check, last_version FROM worker_profiles ORDER BY health_score ASC`).all(),
@@ -5346,6 +5348,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       env.DB.prepare(`SELECT * FROM deploy_history ORDER BY created_at DESC LIMIT 10`).all(),
       env.DB.prepare(`SELECT target, details, created_at FROM actions_log WHERE action_type IN ('cron_stale','latency_degradation','infra_anomaly_check') AND created_at > datetime('now', '-24 hours') ORDER BY created_at DESC LIMIT 20`).all(),
       (env as any).SVC_DAEMON ? (env as any).SVC_DAEMON.fetch(new Request('https://x/health')).then((r: Response) => r.json()).catch(() => null) : Promise.resolve(null),
+      (env as any).SVC_ENGINE ? (env as any).SVC_ENGINE.fetch(new Request('https://x/health')).then((r: Response) => r.json()).catch(() => null) : Promise.resolve(null),
+      (env as any).SVC_DOCTRINE ? (env as any).SVC_DOCTRINE.fetch(new Request('https://x/stats')).then((r: Response) => r.json()).catch(() => null) : Promise.resolve(null),
     ]);
 
     const profiles = (workerProfiles.results || []) as any[];
@@ -5412,6 +5416,25 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         staleTargets: cronHealth.stale,
         errors: cronHealth.errors,
       },
+
+      engineRuntime: engineRuntimeHealth ? {
+        engines: engineRuntimeHealth.engines_loaded || 0,
+        doctrines: engineRuntimeHealth.total_doctrines || 0,
+        queries: engineRuntimeHealth.total_queries || 0,
+        version: engineRuntimeHealth.version || 'unknown',
+      } : {},
+
+      doctrineForge: (() => {
+        if (!doctrineForgeStats?.queue) return {};
+        const q = doctrineForgeStats.queue as any[];
+        const total = q.reduce((s: number, e: any) => s + (e.cnt || 0), 0);
+        const complete = q.filter((e: any) => e.status === 'complete').reduce((s: number, e: any) => s + (e.cnt || 0), 0);
+        return {
+          total,
+          complete,
+          generated: doctrineForgeStats.total_doctrines_generated || 0,
+        };
+      })(),
 
       topLatency: (latencyData.results || []).slice(0, 10),
 

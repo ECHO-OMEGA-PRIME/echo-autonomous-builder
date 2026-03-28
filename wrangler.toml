@@ -20,7 +20,7 @@ binding = "CACHE"
 id = "1714cf3a143e46f0aca7e8bc6ea7d060"
 
 [vars]
-WORKER_VERSION = "3.14.0"
+WORKER_VERSION = "3.15.0"
 CLOUDFLARE_ACCOUNT_ID = "b9af3a4bf161132bb7e5d3d365fb8bb0"
 
 # Service bindings for worker-to-worker communication

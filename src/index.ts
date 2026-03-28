@@ -1,5 +1,5 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.3.0 — "Evolution Engine + Diagnostics Bridge + Latency Monitor + Fleet Dedup"
+ * ECHO AUTONOMOUS BUILDER v3.4.0 — "Enhanced Briefing + Trend Analytics"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
@@ -478,6 +478,15 @@ async function incrementStat(db: D1Database, field: string, amount: number = 1):
   } catch (e) {
     // Stat tracking failure is non-critical
   }
+}
+
+async function setStat(db: D1Database, field: string, value: number): Promise<void> {
+  const d = today();
+  try {
+    await db.prepare(
+      `INSERT INTO daily_stats (date, ${field}) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET ${field} = ?, updated_at = datetime('now')`
+    ).bind(d, value, value).run();
+  } catch { /* non-critical */ }
 }
 
 async function fetchWithTimeout(url: string, opts: RequestInit = {}, timeoutMs: number = 15000): Promise<Response> {
@@ -2556,46 +2565,109 @@ async function postToMoltBook(env: Env, content: string, mood: string = 'buildin
 }
 
 // ═══════════════════════════════════════════════════
-// MODULE 10: DAILY BRIEFING
-// Compiles overnight results into a report
+// MODULE 10: DAILY BRIEFING (Enhanced v2)
+// Compiles overnight results with trend analytics, performer rankings,
+// Engine Runtime/Doctrine Forge stats, version drift, and degradation tracking
 // ═══════════════════════════════════════════════════
 
 async function generateDailyBriefing(env: Env, cid: string): Promise<string> {
   const d = today();
-  const stats = await env.DB.prepare(
-    `SELECT * FROM daily_stats WHERE date = ?`
-  ).bind(d).first();
 
-  const recentActions = await env.DB.prepare(
-    `SELECT action_type, target, result, created_at FROM actions_log ORDER BY created_at DESC LIMIT 20`
-  ).all();
+  // ── Gather all data in parallel ──
+  const [
+    stats, yesterdayStats, recentActions, pendingFixes, completedFixes, failedFixes,
+    workerStats, topWorkers, bottomWorkers, degradedCount, pendingEvolution, uniqueVersions
+  ] = await Promise.all([
+    env.DB.prepare(`SELECT * FROM daily_stats WHERE date = ?`).bind(d).first(),
+    env.DB.prepare(`SELECT * FROM daily_stats WHERE date = date(?, '-1 day')`).bind(d).first(),
+    env.DB.prepare(`SELECT action_type, target, result, created_at FROM actions_log ORDER BY created_at DESC LIMIT 20`).all(),
+    env.DB.prepare(`SELECT COUNT(*) as cnt FROM fix_queue WHERE status = 'pending'`).first() as Promise<any>,
+    env.DB.prepare(`SELECT COUNT(*) as cnt FROM fix_queue WHERE status = 'fixed' AND DATE(resolved_at) = ?`).bind(d).first() as Promise<any>,
+    env.DB.prepare(`SELECT COUNT(*) as cnt FROM fix_queue WHERE status = 'failed' AND DATE(created_at) = ?`).bind(d).first() as Promise<any>,
+    env.DB.prepare(`SELECT COUNT(*) as total, AVG(avg_latency_ms) as avgLatency, AVG(health_score) as avgHealth FROM worker_profiles`).first() as Promise<any>,
+    env.DB.prepare(`SELECT worker_name, health_score, avg_latency_ms FROM worker_profiles WHERE check_count > 5 ORDER BY health_score DESC LIMIT 3`).all(),
+    env.DB.prepare(`SELECT worker_name, health_score, avg_latency_ms FROM worker_profiles WHERE check_count > 5 ORDER BY health_score ASC LIMIT 3`).all(),
+    env.DB.prepare(`SELECT COUNT(DISTINCT worker_name) as cnt FROM latency_history WHERE recorded_at > datetime('now', '-24 hours') AND healthy = 0`).first() as Promise<any>,
+    env.DB.prepare(`SELECT COUNT(*) as cnt FROM evolution_scans WHERE status = 'detected'`).first() as Promise<any>,
+    env.DB.prepare(`SELECT last_version, COUNT(*) as cnt FROM worker_profiles WHERE last_version IS NOT NULL AND last_version != '' GROUP BY last_version ORDER BY cnt DESC`).all()
+  ]);
 
-  const pendingFixes = await env.DB.prepare(
-    `SELECT COUNT(*) as cnt FROM fix_queue WHERE status = 'pending'`
-  ).first() as any;
+  // ── Trend arrows (compare today vs yesterday) ──
+  const trend = (curr: number, prev: number): string => {
+    if (!prev) return '';
+    const delta = curr - prev;
+    if (Math.abs(delta) < 1) return ' →';
+    return delta > 0 ? ` ↑${Math.abs(Math.round(delta))}` : ` ↓${Math.abs(Math.round(delta))}`;
+  };
 
-  const completedFixes = await env.DB.prepare(
-    `SELECT COUNT(*) as cnt FROM fix_queue WHERE status = 'fixed' AND DATE(resolved_at) = ?`
-  ).bind(d).first() as any;
+  const todayWarmups = stats?.warmups as number || 0;
+  const yesterdayWarmups = yesterdayStats?.warmups as number || 0;
+  const todayBugs = (stats?.bugs_found as number) || 0;
+  const yesterdayBugs = (yesterdayStats?.bugs_found as number) || 0;
+  const todayLatency = Math.round(workerStats?.avgLatency || 0);
+  const yesterdayLatency = Math.round((yesterdayStats?.avg_fleet_latency as number) || 0);
 
-  const failedFixes = await env.DB.prepare(
-    `SELECT COUNT(*) as cnt FROM fix_queue WHERE status = 'failed' AND DATE(created_at) = ?`
-  ).bind(d).first() as any;
+  // ── Top / Bottom performers ──
+  const topList = (topWorkers.results || []).map((w: any) =>
+    `  ✓ ${(w.worker_name as string).replace('echo-', '')} — ${Math.round(w.health_score)}% | ${Math.round(w.avg_latency_ms)}ms`
+  ).join('\n');
+  const bottomList = (bottomWorkers.results || []).filter((w: any) => (w.health_score as number) < 95).map((w: any) =>
+    `  ⚠ ${(w.worker_name as string).replace('echo-', '')} — ${Math.round(w.health_score)}% | ${Math.round(w.avg_latency_ms)}ms`
+  ).join('\n');
 
-  const workerStats = await env.DB.prepare(
-    `SELECT COUNT(*) as total, AVG(avg_latency_ms) as avgLatency, AVG(health_score) as avgHealth FROM worker_profiles`
-  ).first() as any;
+  // ── Version diversity ──
+  const versions = (uniqueVersions.results || []) as Array<{ last_version: string; cnt: number }>;
+  const versionLine = versions.length <= 1
+    ? `All workers on ${versions[0]?.last_version || 'unknown'}`
+    : `${versions.length} versions in fleet: ${versions.slice(0, 3).map(v => `${v.last_version}(${v.cnt})`).join(', ')}`;
+
+  // ── Fetch external stats (Engine Runtime + Doctrine Forge) — best-effort ──
+  let engineLine = '';
+  let doctrineLine = '';
+  try {
+    const [engineResp, doctrineResp] = await Promise.all([
+      env.SVC_ENGINE ? env.SVC_ENGINE.fetch(new Request('https://internal/health')).then(r => r.json()).catch(() => null) : Promise.resolve(null),
+      env.SVC_DOCTRINE ? env.SVC_DOCTRINE.fetch(new Request('https://internal/stats')).then(r => r.json()).catch(() => null) : Promise.resolve(null)
+    ]);
+    if (engineResp) {
+      const er = engineResp as any;
+      engineLine = `ENGINE RUNTIME: ${er.engines_loaded || '?'} engines | ${(er.total_doctrines || 0).toLocaleString()} doctrines | ${(er.total_queries || 0).toLocaleString()} queries`;
+    }
+    if (doctrineResp) {
+      const df = doctrineResp as any;
+      const queue = (df.queue || []) as Array<{ status: string; cnt: number }>;
+      const complete = queue.find((q: any) => q.status === 'complete')?.cnt || 0;
+      const pending = queue.find((q: any) => q.status === 'pending')?.cnt || 0;
+      const total = complete + pending;
+      const generated = df.total_doctrines_generated || 0;
+      doctrineLine = `DOCTRINE FORGE: ${complete}/${total} engines complete | ${generated.toLocaleString()} doctrines generated`;
+    }
+  } catch { /* best-effort */ }
+
+  // Persist fleet stats into daily_stats for tomorrow's trend comparison
+  await Promise.all([
+    setStat(env.DB, 'avg_fleet_latency', todayLatency),
+    setStat(env.DB, 'fleet_health_score', Math.round(workerStats?.avgHealth || 0))
+  ]);
 
   const briefing = `DAILY AUTONOMOUS BUILDER BRIEFING — ${d}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WARMUPS: ${stats?.warmups || 0} worker warm-up pings
-BUGS FOUND: ${stats?.bugs_found || 0} | AUTO-RESOLVED: ${stats?.bugs_auto_resolved || 0} | FIXED: ${stats?.bugs_fixed || 0}
+WARMUPS: ${todayWarmups} pings${trend(todayWarmups, yesterdayWarmups)}
+BUGS FOUND: ${todayBugs}${trend(todayBugs, yesterdayBugs)} | AUTO-RESOLVED: ${stats?.bugs_auto_resolved || 0} | FIXED: ${stats?.bugs_fixed || 0}
 DAEMON TASKS RESOLVED: ${stats?.tasks_resolved || 0}
 PAGES FIXED: ${stats?.pages_fixed || 0} | DEPLOYS: ${stats?.deploys || 0}
 BUG HUNT ISSUES: ${stats?.hunt_issues || 0}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FIX QUEUE: ${pendingFixes?.cnt || 0} pending | ${completedFixes?.cnt || 0} fixed today | ${failedFixes?.cnt || 0} failed
-FLEET: ${workerStats?.total || 0} workers tracked | Avg latency: ${Math.round(workerStats?.avgLatency || 0)}ms | Avg health: ${Math.round(workerStats?.avgHealth || 0)}%
+EVOLUTION: ${pendingEvolution?.cnt || 0} pending findings
+FLEET: ${workerStats?.total || 0} workers | Avg latency: ${todayLatency}ms${trend(todayLatency, yesterdayLatency)} | Avg health: ${Math.round(workerStats?.avgHealth || 0)}%
+VERSIONS: ${versionLine}
+DEGRADED (24h): ${degradedCount?.cnt || 0} workers with unhealthy responses
+${engineLine ? `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n${engineLine}` : ''}${doctrineLine ? `\n${doctrineLine}` : ''}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TOP PERFORMERS:
+${topList || '  (insufficient data)'}
+${bottomList ? `NEEDS ATTENTION:\n${bottomList}` : 'ALL WORKERS HEALTHY (95%+)'}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RECENT ACTIONS:
 ${(recentActions.results || []).slice(0, 10).map((a: any) => `  ${a.created_at} | ${a.action_type} → ${a.target} [${a.result}]`).join('\n')}`;

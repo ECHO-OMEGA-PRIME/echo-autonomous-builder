@@ -1,10 +1,10 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.24.0 — "Doctrine Quality Fix"
+ * ECHO AUTONOMOUS BUILDER v3.25.0 — "Fleet Topology Mapper"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
  *
- * 32 Modules:
+ * 33 Modules:
  * 1. Worker Warmer — keeps critical workers warm, eliminates cold-start latency alerts
  * 2. QA Bug Processor — auto-resolves false positives, queues real fixes
  * 3. Daemon Task Resolver — resolves pending performance tasks
@@ -37,6 +37,7 @@
  * 30. Cross-Worker API Contract Testing — verifies service-to-service API contracts
  * 31. Revenue Pipeline Monitor — tracks product health, subscriptions, trials, MRR potential
  * 32. Doctrine Quality Auditor — scans for pre-GOLD doctrines, triggers Forge re-generation
+ * 33. Fleet Topology Mapper — scans wrangler.toml files to build service binding dependency graph
  *
  * Cron Schedule:
  * - every 5 min: warm up critical workers + quick health pulse
@@ -6293,6 +6294,272 @@ async function auditWorkerSecurity(env: Env, cid: string): Promise<SecurityAudit
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 34: Fleet Topology Mapper
+// Scans wrangler.toml files via GitHub to build a dependency graph
+// of service bindings across all workers. Detects circular deps,
+// missing bindings, orphan workers, and enables impact analysis.
+// ═══════════════════════════════════════════════════
+
+interface TopologyEdge {
+  source: string;       // worker that HAS the binding
+  target: string;       // worker being bound TO
+  binding: string;      // binding key name (e.g., SVC_BRAIN)
+}
+
+interface TopologyReport {
+  workers: number;
+  edges: number;
+  scanned: number;
+  errors: number;
+  circularDeps: string[][];
+  orphanWorkers: string[];      // workers with NO inbound or outbound bindings
+  criticalNodes: { worker: string; dependents: number }[];  // most-depended-on workers
+  missingTargets: { source: string; binding: string; target: string }[];
+  graph: Record<string, { outbound: { target: string; binding: string }[]; inbound: string[] }>;
+}
+
+async function mapFleetTopology(env: Env, cid: string): Promise<TopologyReport> {
+  const GH_API = 'https://api.github.com';
+  const ORG = 'ECHO-OMEGA-PRIME';
+  const headers: Record<string, string> = {
+    'Authorization': `token ${env.GITHUB_TOKEN}`,
+    'Accept': 'application/vnd.github.v3+json',
+    'User-Agent': 'echo-autonomous-builder'
+  };
+
+  const report: TopologyReport = {
+    workers: 0, edges: 0, scanned: 0, errors: 0,
+    circularDeps: [], orphanWorkers: [], criticalNodes: [],
+    missingTargets: [],
+    graph: {}
+  };
+
+  try {
+    // Check KV cache — topology doesn't change often, cache for 12 hours
+    const cacheKey = 'fleet_topology_cache';
+    try {
+      const cached = await env.CACHE.get(cacheKey, 'json') as TopologyReport | null;
+      if (cached && cached.workers > 0) {
+        // Return cached but still store to D1 for the audit log
+        await logAction(env.DB, {
+          action_type: 'fleet_topology',
+          target: `${cached.workers} workers`,
+          details: `Cached: ${cached.edges} edges, ${cached.circularDeps.length} circular, ${cached.orphanWorkers.length} orphans, ${cached.criticalNodes.length} critical nodes`,
+          result: 'cached',
+          duration_ms: 0,
+          cycle_id: cid,
+        });
+        return cached;
+      }
+    } catch { /* cache miss */ }
+
+    // Fetch repo list (paginated, max 300 to stay within API budget)
+    // ECHO-OMEGA-PRIME is a user account, not an org — use /users/ endpoint
+    const allRepos: string[] = [];
+    for (let page = 1; page <= 3; page++) {
+      const res = await fetch(`${GH_API}/users/${ORG}/repos?per_page=100&page=${page}&sort=updated`, {
+        headers, signal: AbortSignal.timeout(15000)
+      });
+      if (!res.ok) break;
+      const repos = await res.json() as { name: string }[];
+      if (repos.length === 0) break;
+      allRepos.push(...repos.map(r => r.name));
+    }
+
+    // For each repo, try to fetch wrangler.toml
+    const edges: TopologyEdge[] = [];
+    const workerNames = new Set<string>();
+    const bindingTargets = new Set<string>();
+
+    // Process in batches of 10 to avoid rate limits
+    const batchSize = 10;
+    for (let i = 0; i < allRepos.length; i += batchSize) {
+      const batch = allRepos.slice(i, i + batchSize);
+      const results = await Promise.allSettled(
+        batch.map(async (repo) => {
+          const res = await fetch(
+            `${GH_API}/repos/${ORG}/${repo}/contents/wrangler.toml`,
+            { headers, signal: AbortSignal.timeout(8000) }
+          );
+          if (!res.ok) return null;
+          const data = await res.json() as { content?: string; encoding?: string };
+          if (!data.content) return null;
+          const content = atob(data.content.replace(/\n/g, ''));
+          return { repo, content };
+        })
+      );
+
+      for (const r of results) {
+        if (r.status === 'fulfilled' && r.value) {
+          report.scanned++;
+          const { repo, content } = r.value;
+
+          // Extract worker name from `name = "xxx"` line
+          const nameMatch = content.match(/^name\s*=\s*"([^"]+)"/m);
+          const workerName = nameMatch ? nameMatch[1] : repo;
+          workerNames.add(workerName);
+
+          // Extract [[services]] blocks: binding + service
+          const serviceRegex = /\[\[services\]\]\s*\nbinding\s*=\s*"([^"]+)"\s*\nservice\s*=\s*"([^"]+)"/g;
+          let match;
+          while ((match = serviceRegex.exec(content)) !== null) {
+            const binding = match[1];
+            const target = match[2];
+            edges.push({ source: workerName, target, binding });
+            bindingTargets.add(target);
+          }
+        } else if (r.status === 'rejected') {
+          report.errors++;
+        }
+      }
+    }
+
+    // Build adjacency graph
+    const graph: Record<string, { outbound: { target: string; binding: string }[]; inbound: string[] }> = {};
+
+    // Initialize all known workers
+    for (const w of workerNames) {
+      if (!graph[w]) graph[w] = { outbound: [], inbound: [] };
+    }
+    for (const t of bindingTargets) {
+      if (!graph[t]) graph[t] = { outbound: [], inbound: [] };
+    }
+
+    for (const edge of edges) {
+      if (!graph[edge.source]) graph[edge.source] = { outbound: [], inbound: [] };
+      if (!graph[edge.target]) graph[edge.target] = { outbound: [], inbound: [] };
+      graph[edge.source].outbound.push({ target: edge.target, binding: edge.binding });
+      graph[edge.target].inbound.push(edge.source);
+    }
+
+    // Detect circular dependencies using DFS
+    const visited = new Set<string>();
+    const inStack = new Set<string>();
+    const cycles: string[][] = [];
+
+    function dfs(node: string, path: string[]): void {
+      if (inStack.has(node)) {
+        // Found a cycle — extract it
+        const cycleStart = path.indexOf(node);
+        if (cycleStart >= 0) {
+          cycles.push(path.slice(cycleStart).concat(node));
+        }
+        return;
+      }
+      if (visited.has(node)) return;
+      visited.add(node);
+      inStack.add(node);
+      for (const edge of (graph[node]?.outbound || [])) {
+        dfs(edge.target, [...path, node]);
+      }
+      inStack.delete(node);
+    }
+
+    for (const w of Object.keys(graph)) {
+      dfs(w, []);
+    }
+
+    // Deduplicate cycles (same cycle can be found from different starting points)
+    const seenCycles = new Set<string>();
+    for (const cycle of cycles) {
+      const sorted = [...cycle].sort().join('->');
+      if (!seenCycles.has(sorted)) {
+        seenCycles.add(sorted);
+        report.circularDeps.push(cycle);
+      }
+    }
+
+    // Find orphan workers (no inbound AND no outbound)
+    report.orphanWorkers = Object.entries(graph)
+      .filter(([_, v]) => v.outbound.length === 0 && v.inbound.length === 0)
+      .map(([k]) => k);
+
+    // Find critical nodes (most depended-on)
+    report.criticalNodes = Object.entries(graph)
+      .map(([w, v]) => ({ worker: w, dependents: new Set(v.inbound).size }))
+      .filter(n => n.dependents > 0)
+      .sort((a, b) => b.dependents - a.dependents)
+      .slice(0, 15);
+
+    // Find missing targets (binding references a worker that wasn't found in any repo)
+    for (const edge of edges) {
+      if (!workerNames.has(edge.target)) {
+        // The target might exist but just isn't in our GitHub org (e.g., external)
+        // Only flag if it's an echo-* worker that SHOULD be in our org
+        if (edge.target.startsWith('echo-') || edge.target.startsWith('omniscient-')) {
+          report.missingTargets.push({
+            source: edge.source,
+            binding: edge.binding,
+            target: edge.target
+          });
+        }
+      }
+    }
+
+    report.workers = Object.keys(graph).length;
+    report.edges = edges.length;
+    report.graph = graph;
+
+    // Store in D1
+    try {
+      await env.DB.prepare(`CREATE TABLE IF NOT EXISTS fleet_topology (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        cycle_id TEXT NOT NULL,
+        workers INTEGER DEFAULT 0,
+        edges INTEGER DEFAULT 0,
+        circular_deps TEXT,
+        orphan_workers TEXT,
+        critical_nodes TEXT,
+        missing_targets TEXT,
+        full_graph TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+      )`).run();
+
+      await env.DB.prepare(
+        `INSERT INTO fleet_topology (cycle_id, workers, edges, circular_deps, orphan_workers, critical_nodes, missing_targets, full_graph)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      ).bind(
+        cid,
+        report.workers,
+        report.edges,
+        JSON.stringify(report.circularDeps),
+        JSON.stringify(report.orphanWorkers),
+        JSON.stringify(report.criticalNodes),
+        JSON.stringify(report.missingTargets),
+        JSON.stringify(report.graph)
+      ).run();
+    } catch { /* D1 error, non-fatal */ }
+
+    // Cache for 12 hours
+    try {
+      await env.CACHE.put(cacheKey, JSON.stringify(report), { expirationTtl: 43200 });
+    } catch { /* KV cache write error, non-fatal */ }
+
+    await logAction(env.DB, {
+      action_type: 'fleet_topology',
+      target: `${report.workers} workers`,
+      details: `Scanned: ${report.scanned} repos | Edges: ${report.edges} | Circular: ${report.circularDeps.length} | Orphans: ${report.orphanWorkers.length} | Critical: ${report.criticalNodes.length} (top: ${report.criticalNodes[0]?.worker || 'none'} with ${report.criticalNodes[0]?.dependents || 0} dependents) | Missing: ${report.missingTargets.length}`,
+      result: report.circularDeps.length > 0 ? 'circular_deps_found' : 'clean',
+      duration_ms: 0,
+      cycle_id: cid,
+    });
+
+  } catch (e: any) {
+    report.errors++;
+    await logAction(env.DB, {
+      action_type: 'fleet_topology_error',
+      target: 'topology_scan',
+      details: e.message,
+      result: 'error',
+      duration_ms: 0,
+      cycle_id: cid,
+    });
+  }
+
+  return report;
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -6385,8 +6652,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const revenueReport = await monitorRevenuePipeline(env, cid);
       const doctrineAudit = await auditDoctrineQuality(env, cid);
       const securityAudit = await auditWorkerSecurity(env, cid);
+      const topology = await mapFleetTopology(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations | Contracts: ${contractTests.passed}/${contractTests.total} passed | Revenue: ${revenueReport.revenueReadyCount}/${revenueReport.productsChecked} ready, $${revenueReport.potentialMRR} potential MRR, ${revenueReport.subscriptions.activeTrials} trials, ${revenueReport.subscriptions.activePaid} paid | DoctrineGOLD: ${doctrineAudit.goldPct}% sample, ${doctrineAudit.forgeTriggered} re-forged | Security: ${securityAudit.scanned} scanned, ${securityAudit.findings.length} findings (${securityAudit.findings.filter(f => f.severity === 'critical').length} critical)`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations | Contracts: ${contractTests.passed}/${contractTests.total} passed | Revenue: ${revenueReport.revenueReadyCount}/${revenueReport.productsChecked} ready, $${revenueReport.potentialMRR} potential MRR, ${revenueReport.subscriptions.activeTrials} trials, ${revenueReport.subscriptions.activePaid} paid | DoctrineGOLD: ${doctrineAudit.goldPct}% sample, ${doctrineAudit.forgeTriggered} re-forged | Security: ${securityAudit.scanned} scanned, ${securityAudit.findings.length} findings (${securityAudit.findings.filter(f => f.severity === 'critical').length} critical) | Topology: ${topology.workers} workers, ${topology.edges} edges, ${topology.circularDeps.length} circular, ${topology.criticalNodes[0]?.worker || 'none'} top dependency`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -6494,6 +6762,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         doctrineQuality: 'GET /doctrine-quality (audit history)',
         sla: '/sla',
         contractTests: '/contract-tests',
+        topology: '/topology',
+        topologyImpact: '/topology/impact/:worker',
       }
     }), { headers: corsHeaders });
   }
@@ -6591,7 +6861,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'infrastructure_anomaly_detection', 'on_demand_fleet_report',
         'rolling_uptime_7day', 'profile_rebaseline', 'kv_cron_alert_dedup',
         'sla_compliance_monitoring', 'latency_percentile_dashboard',
-        'api_contract_testing'
+        'api_contract_testing',
+        'fleet_topology_mapping', 'circular_dependency_detection', 'impact_analysis'
       ]
     }), { headers: corsHeaders });
   }
@@ -7654,6 +7925,96 @@ setInterval(()=>{countdown--;document.getElementById('timer').textContent='Refre
     return new Response(slaHtml, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   }
 
+  // ─── /topology ─── Fleet dependency graph
+  if (path === '/topology') {
+    if (request.method === 'POST') {
+      // Force re-scan (clears KV cache)
+      try { await env.CACHE.delete('fleet_topology_cache'); } catch { /* ok */ }
+      const cid = cycleId();
+      const result = await mapFleetTopology(env, cid);
+      return new Response(JSON.stringify({ ...result, cycle_id: cid, timestamp: new Date().toISOString() }), { headers: corsHeaders });
+    }
+
+    // GET — return latest topology from D1
+    try {
+      const latest = await env.DB.prepare(
+        `SELECT * FROM fleet_topology ORDER BY created_at DESC LIMIT 1`
+      ).first<any>();
+
+      if (latest) {
+        const graph = latest.full_graph ? JSON.parse(latest.full_graph) : {};
+        const criticalNodes = latest.critical_nodes ? JSON.parse(latest.critical_nodes) : [];
+        const circularDeps = latest.circular_deps ? JSON.parse(latest.circular_deps) : [];
+        const orphanWorkers = latest.orphan_workers ? JSON.parse(latest.orphan_workers) : [];
+        const missingTargets = latest.missing_targets ? JSON.parse(latest.missing_targets) : [];
+
+        return new Response(JSON.stringify({
+          workers: latest.workers,
+          edges: latest.edges,
+          criticalNodes,
+          circularDeps,
+          orphanWorkers,
+          missingTargets,
+          graph,
+          scannedAt: latest.created_at,
+          timestamp: new Date().toISOString()
+        }), { headers: corsHeaders });
+      }
+
+      return new Response(JSON.stringify({ error: 'No topology data yet. Topology is scanned every 4 hours, or POST /topology to trigger a scan.' }), { status: 404, headers: corsHeaders });
+    } catch {
+      return new Response(JSON.stringify({ error: 'fleet_topology table not yet created' }), { status: 404, headers: corsHeaders });
+    }
+  }
+
+  // ─── /topology/impact/:worker ─── Impact analysis for a specific worker
+  if (path.startsWith('/topology/impact/')) {
+    const workerName = decodeURIComponent(path.split('/topology/impact/')[1]);
+    try {
+      const latest = await env.DB.prepare(
+        `SELECT full_graph FROM fleet_topology ORDER BY created_at DESC LIMIT 1`
+      ).first<{ full_graph: string }>();
+
+      if (!latest?.full_graph) {
+        return new Response(JSON.stringify({ error: 'No topology data yet' }), { status: 404, headers: corsHeaders });
+      }
+
+      const graph = JSON.parse(latest.full_graph) as Record<string, { outbound: { target: string; binding: string }[]; inbound: string[] }>;
+      const node = graph[workerName];
+      if (!node) {
+        return new Response(JSON.stringify({ error: `Worker '${workerName}' not found in topology` }), { status: 404, headers: corsHeaders });
+      }
+
+      // BFS to find all transitive dependents (workers that would be affected if this worker goes down)
+      const affected = new Set<string>();
+      const queue = [workerName];
+      while (queue.length > 0) {
+        const current = queue.shift()!;
+        const currentNode = graph[current];
+        if (!currentNode) continue;
+        for (const dep of currentNode.inbound) {
+          if (!affected.has(dep) && dep !== workerName) {
+            affected.add(dep);
+            queue.push(dep);
+          }
+        }
+      }
+
+      return new Response(JSON.stringify({
+        worker: workerName,
+        directDependents: node.inbound.length,
+        transitiveDependents: affected.size,
+        directDependentList: node.inbound,
+        transitiveDependentList: [...affected],
+        dependencies: node.outbound,
+        impactSeverity: affected.size > 20 ? 'critical' : affected.size > 10 ? 'high' : affected.size > 3 ? 'medium' : 'low',
+        timestamp: new Date().toISOString()
+      }), { headers: corsHeaders });
+    } catch (e: any) {
+      return new Response(JSON.stringify({ error: e.message }), { status: 500, headers: corsHeaders });
+    }
+  }
+
   // ─── 404 ───
   return new Response(JSON.stringify({
     error: 'Not found',
@@ -7665,7 +8026,8 @@ setInterval(()=>{countdown--;document.getElementById('timer').textContent='Refre
       'GET /evolution/activity', 'GET /evolution/scans', 'GET /evolution/projects',
       'GET /evolution/changes', 'GET /evolution/sandbox',
       'GET /report', 'GET /infra-anomaly', 'GET /cron-health', 'GET /drift',
-      'GET /fleet-overview', 'POST /rebaseline', 'GET /dashboard'
+      'GET /fleet-overview', 'POST /rebaseline', 'GET /dashboard',
+      'GET /topology', 'POST /topology', 'GET /topology/impact/:worker'
     ]
   }), { status: 404, headers: corsHeaders });
 }

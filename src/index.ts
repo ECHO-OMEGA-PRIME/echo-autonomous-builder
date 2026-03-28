@@ -1,5 +1,5 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.4.0 — "Enhanced Briefing + Trend Analytics"
+ * ECHO AUTONOMOUS BUILDER v3.6.0 — "API Endpoint Verifier"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
@@ -3993,6 +3993,143 @@ async function pruneStaleData(env: Env, cid: string): Promise<{ pruned: Record<s
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 22: API ENDPOINT VERIFIER
+// Deep health checks beyond simple warmup pings.
+// Tests JSON validity, CORS, auth protection, and
+// error handling on rotating subsets of workers.
+// ═══════════════════════════════════════════════════
+
+interface EndpointVerifyResult {
+  worker: string;
+  checks: { name: string; passed: boolean; detail: string }[];
+  score: number; // 0-100
+}
+
+// Workers known to have auth-protected write endpoints
+const AUTH_PROTECTED_WORKERS = [
+  'echo-crm', 'echo-helpdesk', 'echo-booking', 'echo-invoice',
+  'echo-forms', 'echo-hr', 'echo-inventory', 'echo-contracts',
+  'echo-lms', 'echo-email-marketing', 'echo-surveys', 'echo-knowledge-base',
+  'echo-social-media', 'echo-document-manager', 'echo-live-chat',
+  'echo-link-shortener', 'echo-feedback-board', 'echo-newsletter',
+  'echo-web-analytics', 'echo-waitlist', 'echo-reviews', 'echo-signatures',
+  'echo-affiliate', 'echo-proposals', 'echo-gamer-companion', 'echo-qr-menu',
+  'echo-podcast', 'echo-compliance', 'echo-timesheet', 'echo-payroll',
+  'echo-recruiting', 'echo-calendar', 'echo-workflow-automation',
+  'echo-finance-ai', 'echo-project-manager', 'echo-home-ai',
+  'echo-shepherd-ai', 'echo-call-center', 'echo-expense', 'echo-okr',
+];
+
+async function verifyEndpoints(env: Env, cid: string): Promise<{ verified: number; issues: string[]; results: EndpointVerifyResult[] }> {
+  const issues: string[] = [];
+  const results: EndpointVerifyResult[] = [];
+
+  // Pick 8 random workers from AUTH_PROTECTED list (rotate each cycle)
+  const pool = AUTH_PROTECTED_WORKERS.filter(w => SERVICE_BINDING_MAP[w] && env[SERVICE_BINDING_MAP[w]]);
+  const shuffled = pool.sort(() => Math.random() - 0.5);
+  const batch = shuffled.slice(0, 8);
+
+  for (const worker of batch) {
+    const checks: { name: string; passed: boolean; detail: string }[] = [];
+
+    // Check 1: Root endpoint returns valid JSON
+    const root = await workerFetch(env, worker, '/', {}, 8000);
+    const isJson = root.data && typeof root.data === 'object';
+    checks.push({
+      name: 'json_response',
+      passed: isJson,
+      detail: isJson ? 'Valid JSON' : `Non-JSON response (status ${root.status})`
+    });
+
+    // Check 2: CORS — OPTIONS should not 500
+    const cors = await workerFetch(env, worker, '/', { method: 'OPTIONS' }, 5000);
+    const corsOk = cors.status !== 500 && cors.status !== 0;
+    checks.push({
+      name: 'cors_support',
+      passed: corsOk,
+      detail: corsOk ? `OPTIONS → ${cors.status}` : `OPTIONS failed (${cors.status})`
+    });
+
+    // Check 3: Auth protection — POST without auth key should return 401 or 403
+    // Try common write endpoints
+    const writeEndpoints = ['/api/tenants', '/tenants', '/api/items', '/items'];
+    let authChecked = false;
+    for (const ep of writeEndpoints) {
+      const authTest = await workerFetch(env, worker, ep, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ test: true })
+      }, 5000);
+
+      if (authTest.status === 401 || authTest.status === 403) {
+        checks.push({ name: 'auth_protection', passed: true, detail: `POST ${ep} → ${authTest.status} (protected)` });
+        authChecked = true;
+        break;
+      } else if (authTest.status === 200 || authTest.status === 201) {
+        checks.push({ name: 'auth_protection', passed: false, detail: `POST ${ep} → ${authTest.status} (UNPROTECTED!)` });
+        issues.push(`${worker}: POST ${ep} accepted without auth (${authTest.status})`);
+        authChecked = true;
+        break;
+      }
+      // 404 = endpoint doesn't exist, try next
+    }
+    if (!authChecked) {
+      checks.push({ name: 'auth_protection', passed: true, detail: 'No standard write endpoints found (OK)' });
+    }
+
+    // Check 4: Error handling — malformed POST should not 500
+    const malformed = await workerFetch(env, worker, '/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{invalid json!!'
+    }, 5000);
+    const errorHandled = malformed.status !== 500;
+    checks.push({
+      name: 'error_handling',
+      passed: errorHandled,
+      detail: errorHandled ? `Malformed POST → ${malformed.status}` : `Malformed POST → 500 (unhandled!)`
+    });
+    if (!errorHandled) {
+      issues.push(`${worker}: Crashes on malformed JSON (500)`);
+    }
+
+    // Check 5: Version info present
+    const hasVersion = root.data?.version || root.data?.WORKER_VERSION;
+    checks.push({
+      name: 'version_info',
+      passed: !!hasVersion,
+      detail: hasVersion ? `v${hasVersion}` : 'No version in root response'
+    });
+
+    const passed = checks.filter(c => c.passed).length;
+    const score = Math.round((passed / checks.length) * 100);
+    results.push({ worker, checks, score });
+
+    // Queue fix if score < 60%
+    if (score < 60) {
+      const failedChecks = checks.filter(c => !c.passed).map(c => c.name).join(', ');
+      try {
+        await env.DB.prepare(
+          `INSERT OR IGNORE INTO fix_queue (worker_name, issue_type, description, priority, status, created_at)
+           VALUES (?, 'endpoint_verification', ?, 'medium', 'pending', datetime('now'))`
+        ).bind(worker, `Failed checks: ${failedChecks} (score: ${score}%)`).run();
+      } catch {}
+    }
+  }
+
+  await logAction(env.DB, {
+    action_type: 'endpoint_verify',
+    target: `${batch.length} workers`,
+    details: `Verified ${results.length} workers. Issues: ${issues.length}. Avg score: ${results.length > 0 ? Math.round(results.reduce((s, r) => s + r.score, 0) / results.length) : 0}%`,
+    result: issues.length === 0 ? 'all_passing' : 'issues_found',
+    duration_ms: 0,
+    cycle_id: cid
+  });
+
+  return { verified: results.length, issues, results };
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -4027,8 +4164,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const daemonResult = await processDaemonTasks(env, cid);
       const fixResult = await executeFixQueue(env, cid, 15);
       const evoFixResult = await executeEvolutionFixes(env, cid);
+      const verifyResult = await verifyEndpoints(env, cid);
 
-      const summary = `Cycle ${cid}: QA processed=${qaResult.processed} autoResolved=${qaResult.autoResolved} queued=${qaResult.queued} | Daemon processed=${daemonResult.processed} resolved=${daemonResult.resolved} | Fixes attempted=${fixResult.attempted} fixed=${fixResult.fixed} failed=${fixResult.failed} | EvoFixes fixed=${evoFixResult.fixed}/${evoFixResult.attempted} failed=${evoFixResult.failed}`;
+      const summary = `Cycle ${cid}: QA processed=${qaResult.processed} autoResolved=${qaResult.autoResolved} queued=${qaResult.queued} | Daemon processed=${daemonResult.processed} resolved=${daemonResult.resolved} | Fixes attempted=${fixResult.attempted} fixed=${fixResult.fixed} failed=${fixResult.failed} | EvoFixes fixed=${evoFixResult.fixed}/${evoFixResult.attempted} failed=${evoFixResult.failed} | Verify: ${verifyResult.verified} checked, ${verifyResult.issues.length} issues`;
 
       await logAction(env.DB, {
         action_type: 'cycle_30min',
@@ -4145,6 +4283,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         diagnosticsBridge: '/diagnostics/bridge',
         latency: '/latency',
         latencyDegraded: '/latency/degraded',
+        verify: '/verify',
       }
     }), { headers: corsHeaders });
   }
@@ -4215,7 +4354,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'structured_logging_auto_fix', 'root_route_auto_fix',
         'diagnostics_bridge', 'diagnostics_auto_resolve',
         'latency_monitoring', 'latency_degradation_detection',
-        'dependency_audit', 'fleet_trend_analysis', 'stale_data_pruning'
+        'dependency_audit', 'fleet_trend_analysis', 'stale_data_pruning',
+        'api_endpoint_verification', 'auth_protection_audit', 'error_handling_audit'
       ]
     }), { headers: corsHeaders });
   }
@@ -4282,6 +4422,20 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         coldStarts: r.unhealthy_checks || 0
       })),
       recentAnalysis: recentAnalysis.results
+    }), { headers: corsHeaders });
+  }
+
+  // ─── /verify ───
+  if (path === '/verify') {
+    const recent = await env.DB.prepare(
+      `SELECT * FROM actions_log WHERE action_type = 'endpoint_verify' ORDER BY created_at DESC LIMIT 10`
+    ).all();
+    return new Response(JSON.stringify({
+      service: 'echo-autonomous-builder',
+      description: 'API Endpoint Verification — deep health checks beyond warmup',
+      authProtectedWorkers: AUTH_PROTECTED_WORKERS.length,
+      reachableWorkers: AUTH_PROTECTED_WORKERS.filter(w => SERVICE_BINDING_MAP[w]).length,
+      recentVerifications: recent.results
     }), { headers: corsHeaders });
   }
 

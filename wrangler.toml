@@ -127,3 +127,58 @@ service = "echo-call-center"
 [[services]]
 binding = "SVC_DIAGNOSTICS"
 service = "echo-diagnostics-agent"
+
+# ═══ Missing CRITICAL_WORKERS bindings (2026-03-28 CC10) ═══
+# These 13 workers were in CRITICAL_WORKERS but had no service binding,
+# causing 13/34 warmup failures every cycle (same-account routing bug).
+[[services]]
+binding = "SVC_BOOKING"
+service = "echo-booking"
+
+[[services]]
+binding = "SVC_INVOICE"
+service = "echo-invoice"
+
+[[services]]
+binding = "SVC_LIVECHAT"
+service = "echo-live-chat"
+
+[[services]]
+binding = "SVC_PAYROLL"
+service = "echo-payroll"
+
+[[services]]
+binding = "SVC_RECRUITING"
+service = "echo-recruiting"
+
+[[services]]
+binding = "SVC_EMAIL"
+service = "echo-email-sender"
+
+[[services]]
+binding = "SVC_REPORTGEN"
+service = "echo-report-generator"
+
+[[services]]
+binding = "SVC_FORMS"
+service = "echo-forms"
+
+[[services]]
+binding = "SVC_PM"
+service = "echo-project-manager"
+
+[[services]]
+binding = "SVC_HR"
+service = "echo-hr"
+
+[[services]]
+binding = "SVC_CALENDAR"
+service = "echo-calendar"
+
+[[services]]
+binding = "SVC_WORKFLOW"
+service = "echo-workflow-automation"
+
+[[services]]
+binding = "SVC_FINANCE"
+service = "echo-finance-ai"

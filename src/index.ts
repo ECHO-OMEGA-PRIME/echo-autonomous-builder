@@ -90,6 +90,20 @@ const SERVICE_BINDING_MAP: Record<string, string> = {
   'echo-home-ai': 'SVC_HOME',
   'echo-shepherd-ai': 'SVC_SHEPHERD',
   'echo-call-center': 'SVC_CALLCENTER',
+  // 13 missing CRITICAL_WORKERS bindings (2026-03-28 CC10)
+  'echo-booking': 'SVC_BOOKING',
+  'echo-invoice': 'SVC_INVOICE',
+  'echo-live-chat': 'SVC_LIVECHAT',
+  'echo-payroll': 'SVC_PAYROLL',
+  'echo-recruiting': 'SVC_RECRUITING',
+  'echo-email-sender': 'SVC_EMAIL',
+  'echo-report-generator': 'SVC_REPORTGEN',
+  'echo-forms': 'SVC_FORMS',
+  'echo-project-manager': 'SVC_PM',
+  'echo-hr': 'SVC_HR',
+  'echo-calendar': 'SVC_CALENDAR',
+  'echo-workflow-automation': 'SVC_WORKFLOW',
+  'echo-finance-ai': 'SVC_FINANCE',
 };
 
 interface ActionLog {

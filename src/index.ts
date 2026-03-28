@@ -5903,7 +5903,6 @@ async function auditDoctrineQuality(env: Env, cid: string): Promise<DoctrineQual
       const pendingInQueue = queue.find((q: any) => q.status === 'pending')?.cnt || 0;
       const forgingInQueue = queue.find((q: any) => q.status === 'forging')?.cnt || 0;
       forgeBusy = pendingInQueue > 50 || forgingInQueue > 5;
-      (report as any)._forgeQueue = { pending: pendingInQueue, forging: forgingInQueue, busy: forgeBusy };
     }
   } catch { /* continue with audit anyway */ }
 
@@ -5921,35 +5920,23 @@ async function auditDoctrineQuality(env: Env, cid: string): Promise<DoctrineQual
 
     const worstEngines: Array<{ engine_id: string; total: number; gold: number; goldPct: number }> = [];
 
-    // Capture raw text first for debugging
-    const rawText = await qualityRes.text();
-    (report as any)._raw_status = qualityRes.status;
-    (report as any)._raw_length = rawText.length;
-    (report as any)._raw_preview = rawText.substring(0, 200);
+    if (qualityRes.ok) {
+      const qData = await qualityRes.json() as any;
+      if (qData.ok && qData.total_doctrines) {
+        report.totalDoctrines = qData.total_doctrines;
+        report.goldDoctrines = qData.gold_doctrines || 0;
+        report.goldPct = qData.gold_pct || 0;
+      }
 
-    if (qualityRes.ok || qualityRes.status === 200) {
-      try {
-        const qData = JSON.parse(rawText) as any;
-        if (qData.ok && qData.total_doctrines) {
-          report.totalDoctrines = qData.total_doctrines;
-          report.goldDoctrines = qData.gold_doctrines || 0;
-          report.goldPct = qData.gold_pct || 0;
+      const priorityPrefixes = ['TX', 'LG', 'LM', 'DRL', 'SEC', 'RE', 'FIN', 'TAX'];
+      const engines = (qData.engines || []) as Array<{ engine_id: string; total: number; gold: number; goldPct: number }>;
+      for (const eng of engines) {
+        if (priorityPrefixes.some(p => eng.engine_id.startsWith(p))) {
+          worstEngines.push(eng);
         }
-
-        // Filter to priority engines and sort by worst GOLD ratio
-        const priorityPrefixes = ['TX', 'LG', 'LM', 'DRL', 'SEC', 'RE', 'FIN', 'TAX'];
-        const engines = (qData.engines || []) as Array<{ engine_id: string; total: number; gold: number; goldPct: number }>;
-        for (const eng of engines) {
-          if (priorityPrefixes.some(p => eng.engine_id.startsWith(p))) {
-            worstEngines.push(eng);
-          }
-        }
-        (report as any)._debug = { engines_received: engines.length, priority_matched: worstEngines.length, gold_from_api: qData.gold_doctrines, qData_ok: qData.ok, sample_ids: engines.slice(0, 5).map((e: any) => e.engine_id) };
-      } catch (parseErr: any) {
-        report.forgeErrors.push(`JSON parse error: ${parseErr.message} | raw: ${rawText.substring(0, 100)}`);
       }
     } else {
-      report.forgeErrors.push(`/doctrine-quality HTTP ${qualityRes.status}: ${rawText.substring(0, 100)}`);
+      report.forgeErrors.push(`/doctrine-quality HTTP ${qualityRes.status}`);
     }
 
     // Sort by worst GOLD ratio — show engines that most need upgrading

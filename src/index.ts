@@ -6573,6 +6573,170 @@ async function mapFleetTopology(env: Env, cid: string): Promise<TopologyReport> 
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 35: DEPLOY REGRESSION DETECTOR
+// After deploys, compares pre/post latency and health
+// from latency_history to detect regressions. Flags
+// latency spikes (>2x) and health drops (>10pp).
+// ═══════════════════════════════════════════════════
+
+interface DeployRegression {
+  worker: string;
+  deploy_id: number;
+  commit_sha: string;
+  deployed_at: string;
+  metric: 'latency_spike' | 'health_drop' | 'error_spike';
+  pre_value: number;
+  post_value: number;
+  severity: 'critical' | 'high' | 'medium';
+}
+
+async function detectDeployRegressions(env: Env, cid: string): Promise<{ checked: number; regressions: DeployRegression[] }> {
+  const result = { checked: 0, regressions: [] as DeployRegression[] };
+
+  try {
+    // Create regressions table if not exists
+    await env.DB.prepare(`CREATE TABLE IF NOT EXISTS deploy_regressions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      cycle_id TEXT NOT NULL,
+      worker_name TEXT NOT NULL,
+      deploy_id INTEGER,
+      commit_sha TEXT,
+      deployed_at TEXT,
+      metric TEXT NOT NULL,
+      pre_value REAL NOT NULL,
+      post_value REAL NOT NULL,
+      severity TEXT DEFAULT 'medium',
+      status TEXT DEFAULT 'detected',
+      created_at TEXT DEFAULT (datetime('now'))
+    )`).run();
+
+    // Get deploys from the last 6 hours
+    const deploys = await env.DB.prepare(`
+      SELECT id, repo, commit_sha, created_at
+      FROM deploy_history
+      WHERE created_at > datetime('now', '-6 hours')
+        AND status = 'success'
+      ORDER BY created_at DESC
+    `).all();
+
+    if (!deploys.results?.length) return result;
+
+    for (const deploy of deploys.results as any[]) {
+      const repo = deploy.repo as string;
+      // Map repo name to worker name (most repos match worker name)
+      const workerName = repo.replace(/^echo-omega-prime\/|ECHO-OMEGA-PRIME\//i, '');
+      const deployTime = deploy.created_at as string;
+
+      result.checked++;
+
+      // Get pre-deploy latency stats (2h window before deploy)
+      const pre = await env.DB.prepare(`
+        SELECT
+          COUNT(*) as checks,
+          AVG(CASE WHEN healthy = 1 THEN latency_ms ELSE NULL END) as avg_lat,
+          SUM(CASE WHEN healthy = 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as error_pct
+        FROM latency_history
+        WHERE worker_name = ?
+          AND recorded_at BETWEEN datetime(?, '-2 hours') AND datetime(?)
+          AND recorded_at < ?
+      `).bind(workerName, deployTime, deployTime, deployTime).first() as any;
+
+      // Get post-deploy latency stats (2h window after deploy, or until now)
+      const post = await env.DB.prepare(`
+        SELECT
+          COUNT(*) as checks,
+          AVG(CASE WHEN healthy = 1 THEN latency_ms ELSE NULL END) as avg_lat,
+          SUM(CASE WHEN healthy = 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as error_pct
+        FROM latency_history
+        WHERE worker_name = ?
+          AND recorded_at > ?
+          AND recorded_at <= datetime(?, '+2 hours')
+      `).bind(workerName, deployTime, deployTime).first() as any;
+
+      // Need sufficient samples in both windows
+      if (!pre || !post || (pre.checks as number) < 3 || (post.checks as number) < 3) continue;
+
+      const preAvg = pre.avg_lat as number || 0;
+      const postAvg = post.avg_lat as number || 0;
+      const preErr = pre.error_pct as number || 0;
+      const postErr = post.error_pct as number || 0;
+
+      // Latency spike: post > 2x pre (only if pre was meaningful, >50ms)
+      if (preAvg > 50 && postAvg > preAvg * 2) {
+        const severity = postAvg > preAvg * 4 ? 'critical' : postAvg > preAvg * 3 ? 'high' : 'medium';
+        const reg: DeployRegression = {
+          worker: workerName,
+          deploy_id: deploy.id as number,
+          commit_sha: deploy.commit_sha as string || '',
+          deployed_at: deployTime,
+          metric: 'latency_spike',
+          pre_value: Math.round(preAvg),
+          post_value: Math.round(postAvg),
+          severity,
+        };
+        result.regressions.push(reg);
+
+        await env.DB.prepare(
+          `INSERT INTO deploy_regressions (cycle_id, worker_name, deploy_id, commit_sha, deployed_at, metric, pre_value, post_value, severity)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(cid, reg.worker, reg.deploy_id, reg.commit_sha, reg.deployed_at, reg.metric, reg.pre_value, reg.post_value, reg.severity).run().catch(() => {});
+      }
+
+      // Health drop: post error rate > pre error rate + 10 percentage points
+      if (postErr > preErr + 10) {
+        const severity = postErr > 50 ? 'critical' : postErr > 25 ? 'high' : 'medium';
+        const reg: DeployRegression = {
+          worker: workerName,
+          deploy_id: deploy.id as number,
+          commit_sha: deploy.commit_sha as string || '',
+          deployed_at: deployTime,
+          metric: 'health_drop',
+          pre_value: Math.round(preErr * 100) / 100,
+          post_value: Math.round(postErr * 100) / 100,
+          severity,
+        };
+        result.regressions.push(reg);
+
+        await env.DB.prepare(
+          `INSERT INTO deploy_regressions (cycle_id, worker_name, deploy_id, commit_sha, deployed_at, metric, pre_value, post_value, severity)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(cid, reg.worker, reg.deploy_id, reg.commit_sha, reg.deployed_at, reg.metric, reg.pre_value, reg.post_value, reg.severity).run().catch(() => {});
+      }
+    }
+
+    await logAction(env.DB, {
+      action_type: 'deploy_regression_check',
+      target: `${result.checked} deploys`,
+      details: `Checked ${result.checked} deploys, ${result.regressions.length} regressions (${result.regressions.filter(r => r.severity === 'critical').length} critical)`,
+      result: result.regressions.length > 0 ? 'regressions_found' : 'clean',
+      duration_ms: 0,
+      cycle_id: cid,
+    });
+
+    // Alert on critical regressions
+    if (result.regressions.some(r => r.severity === 'critical')) {
+      const criticals = result.regressions.filter(r => r.severity === 'critical');
+      await reportToBrain(env,
+        `DEPLOY REGRESSION ALERT: ${criticals.length} critical regressions detected! ${criticals.map(r => `${r.worker}: ${r.metric} ${r.pre_value}→${r.post_value}`).join(', ')}`,
+        9, ['deploy-regression', 'alert', 'critical']
+      );
+    }
+
+  } catch (e: any) {
+    await logAction(env.DB, {
+      action_type: 'deploy_regression_check',
+      target: 'fleet',
+      details: `Error: ${e.message}`,
+      result: 'error',
+      duration_ms: 0,
+      cycle_id: cid,
+    });
+  }
+
+  return result;
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -6614,8 +6778,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const evoFixResult = await executeEvolutionFixes(env, cid);
       const verifyResult = await verifyEndpoints(env, cid);
       const cronHealth = await monitorCronHealth(env, cid);
+      const deployRegress = await detectDeployRegressions(env, cid);
 
-      const summary = `Cycle ${cid}: QA processed=${qaResult.processed} autoResolved=${qaResult.autoResolved} queued=${qaResult.queued} | Daemon processed=${daemonResult.processed} resolved=${daemonResult.resolved} | Fixes attempted=${fixResult.attempted} fixed=${fixResult.fixed} failed=${fixResult.failed} | EvoFixes fixed=${evoFixResult.fixed}/${evoFixResult.attempted} failed=${evoFixResult.failed} | Verify: ${verifyResult.verified} checked, ${verifyResult.issues.length} issues | CronHealth: ${cronHealth.healthy}/${cronHealth.checked} healthy, ${cronHealth.stale.length} stale`;
+      const summary = `Cycle ${cid}: QA processed=${qaResult.processed} autoResolved=${qaResult.autoResolved} queued=${qaResult.queued} | Daemon processed=${daemonResult.processed} resolved=${daemonResult.resolved} | Fixes attempted=${fixResult.attempted} fixed=${fixResult.fixed} failed=${fixResult.failed} | EvoFixes fixed=${evoFixResult.fixed}/${evoFixResult.attempted} failed=${evoFixResult.failed} | Verify: ${verifyResult.verified} checked, ${verifyResult.issues.length} issues | CronHealth: ${cronHealth.healthy}/${cronHealth.checked} healthy, ${cronHealth.stale.length} stale | DeployRegress: ${deployRegress.regressions.length}/${deployRegress.checked} regressions`;
 
       await logAction(env.DB, {
         action_type: 'cycle_30min',
@@ -6666,8 +6831,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const doctrineAudit = await auditDoctrineQuality(env, cid);
       const securityAudit = await auditWorkerSecurity(env, cid);
       const topology = await mapFleetTopology(env, cid);
+      const deployRegress4h = await detectDeployRegressions(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations | Contracts: ${contractTests.passed}/${contractTests.total} passed | Revenue: ${revenueReport.revenueReadyCount}/${revenueReport.productsChecked} ready, $${revenueReport.potentialMRR} potential MRR, ${revenueReport.subscriptions.activeTrials} trials, ${revenueReport.subscriptions.activePaid} paid | DoctrineGOLD: ${doctrineAudit.goldPct}% sample, ${doctrineAudit.forgeTriggered} re-forged | Security: ${securityAudit.scanned} scanned, ${securityAudit.findings.length} findings (${securityAudit.findings.filter(f => f.severity === 'critical').length} critical) | Topology: ${topology.workers} workers, ${topology.edges} edges, ${topology.circularDeps.length} circular, ${topology.criticalNodes[0]?.worker || 'none'} top dependency`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations | Contracts: ${contractTests.passed}/${contractTests.total} passed | Revenue: ${revenueReport.revenueReadyCount}/${revenueReport.productsChecked} ready, $${revenueReport.potentialMRR} potential MRR, ${revenueReport.subscriptions.activeTrials} trials, ${revenueReport.subscriptions.activePaid} paid | DoctrineGOLD: ${doctrineAudit.goldPct}% sample, ${doctrineAudit.forgeTriggered} re-forged | Security: ${securityAudit.scanned} scanned, ${securityAudit.findings.length} findings (${securityAudit.findings.filter(f => f.severity === 'critical').length} critical) | Topology: ${topology.workers} workers, ${topology.edges} edges, ${topology.circularDeps.length} circular, ${topology.criticalNodes[0]?.worker || 'none'} top dependency | DeployRegress: ${deployRegress4h.regressions.length}/${deployRegress4h.checked} regressions`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -7603,6 +7769,51 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     const body = await request.json().catch(() => ({})) as any;
     if (body.id) {
       await env.DB.prepare("UPDATE security_findings SET status = 'resolved', resolved_at = datetime('now') WHERE id = ?").bind(body.id).run();
+      return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders });
+    }
+    return new Response(JSON.stringify({ error: 'id required' }), { status: 400, headers: corsHeaders });
+  }
+
+  // ─── GET /deploy-regression ───
+  if (path === '/deploy-regression' && request.method === 'GET') {
+    try {
+      const status = url.searchParams.get('status');
+      const severity = url.searchParams.get('severity');
+      const limit = parseInt(url.searchParams.get('limit') || '50');
+      let query = 'SELECT * FROM deploy_regressions WHERE 1=1';
+      const params: any[] = [];
+      if (status) { query += ' AND status = ?'; params.push(status); }
+      if (severity) { query += ' AND severity = ?'; params.push(severity); }
+      query += ' ORDER BY created_at DESC LIMIT ?';
+      params.push(limit);
+      const rows = await env.DB.prepare(query).bind(...params).all();
+      const results = rows.results || [];
+      const summary = {
+        total: results.length,
+        critical: results.filter((r: any) => r.severity === 'critical').length,
+        high: results.filter((r: any) => r.severity === 'high').length,
+        medium: results.filter((r: any) => r.severity === 'medium').length,
+        detected: results.filter((r: any) => r.status === 'detected').length,
+        resolved: results.filter((r: any) => r.status === 'resolved').length,
+      };
+      return new Response(JSON.stringify({ regressions: results, summary }), { headers: corsHeaders });
+    } catch {
+      return new Response(JSON.stringify({ regressions: [], summary: { total: 0 } }), { headers: corsHeaders });
+    }
+  }
+
+  // ─── POST /deploy-regression (manual trigger) ───
+  if (path === '/deploy-regression' && request.method === 'POST') {
+    const cid = cycleId();
+    const result = await detectDeployRegressions(env, cid);
+    return new Response(JSON.stringify(result), { headers: corsHeaders });
+  }
+
+  // ─── POST /deploy-regression/resolve ───
+  if (path === '/deploy-regression/resolve' && request.method === 'POST') {
+    const body = await request.json().catch(() => ({})) as any;
+    if (body.id) {
+      await env.DB.prepare("UPDATE deploy_regressions SET status = 'resolved' WHERE id = ?").bind(body.id).run();
       return new Response(JSON.stringify({ ok: true }), { headers: corsHeaders });
     }
     return new Response(JSON.stringify({ error: 'id required' }), { status: 400, headers: corsHeaders });

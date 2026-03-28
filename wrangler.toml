@@ -119,3 +119,7 @@ service = "echo-shepherd-ai"
 [[services]]
 binding = "SVC_CALLCENTER"
 service = "echo-call-center"
+
+[[services]]
+binding = "SVC_DIAGNOSTICS"
+service = "echo-diagnostics-agent"

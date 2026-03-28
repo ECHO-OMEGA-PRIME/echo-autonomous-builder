@@ -3460,6 +3460,76 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return new Response(JSON.stringify({ deploys: deploys.results }), { headers: corsHeaders });
   }
 
+  // ─── /fleet-overview ───  (aggregates all autonomous systems into one view)
+  if (path === '/fleet-overview') {
+    const [
+      builderStats,
+      workerProfiles,
+      pendingFixes,
+      evolutionScans,
+      recentActions,
+      daemonHealth,
+      diagnosticsHealth,
+      qaHealth,
+    ] = await Promise.all([
+      env.DB.prepare(`SELECT * FROM daily_stats WHERE date = ?`).bind(today()).first(),
+      env.DB.prepare(`SELECT worker_name, avg_latency_ms, health_score, last_check, last_version FROM worker_profiles ORDER BY health_score ASC`).all(),
+      env.DB.prepare(`SELECT COUNT(*) as cnt FROM fix_queue WHERE status = 'pending'`).first() as Promise<any>,
+      env.DB.prepare(`SELECT scan_type, status, COUNT(*) as cnt FROM evolution_scans GROUP BY scan_type, status`).all(),
+      env.DB.prepare(`SELECT action_type, target, result, created_at FROM actions_log ORDER BY created_at DESC LIMIT 10`).all(),
+      (env as any).SVC_DAEMON ? (env as any).SVC_DAEMON.fetch(new Request('https://x/health')).then((r: Response) => r.json()).catch(() => ({ error: 'unreachable' })) : Promise.resolve({ error: 'no binding' }),
+      (env as any).SVC_DIAGNOSTICS ? (env as any).SVC_DIAGNOSTICS.fetch(new Request('https://x/health')).then((r: Response) => r.json()).catch(() => ({ error: 'unreachable' })) : Promise.resolve({ error: 'no binding' }),
+      (env as any).SVC_QA ? (env as any).SVC_QA.fetch(new Request('https://x/health')).then((r: Response) => r.json()).catch(() => ({ error: 'unreachable' })) : Promise.resolve({ error: 'no binding' }),
+    ]);
+
+    const healthyWorkers = (workerProfiles.results || []).filter((w: any) => w.health_score >= 80).length;
+    const degradedWorkers = (workerProfiles.results || []).filter((w: any) => w.health_score > 0 && w.health_score < 80).length;
+    const totalWorkers = (workerProfiles.results || []).length;
+
+    return new Response(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      overview: {
+        fleetScore: daemonHealth?.fleetScore || 0,
+        totalWorkers,
+        healthyWorkers,
+        degradedWorkers,
+        pendingFixes: pendingFixes?.cnt || 0,
+        daemonCycles: daemonHealth?.cycles || 0,
+        daemonUptime: daemonHealth?.uptimeSeconds || 0,
+        diagnosticsFindings: diagnosticsHealth?.stats?.total || 0,
+        diagnosticsCritical: diagnosticsHealth?.stats?.critical || 0,
+        qaPagesRegistered: qaHealth?.pagesRegistered || 0,
+        qaOpenBugs: 0,
+      },
+      builder: {
+        version: env.WORKER_VERSION,
+        todayStats: builderStats || {},
+        capabilities: 18,
+      },
+      daemon: {
+        version: daemonHealth?.version || 'unknown',
+        fleetScore: daemonHealth?.fleetScore || 0,
+        capabilities: daemonHealth?.capabilities || 0,
+        cycles: daemonHealth?.cycles || 0,
+      },
+      diagnostics: {
+        version: diagnosticsHealth?.version || 'unknown',
+        findings: diagnosticsHealth?.stats || {},
+        reposTracked: diagnosticsHealth?.reposTracked || 0,
+      },
+      qa: {
+        version: qaHealth?.version || 'unknown',
+        pagesRegistered: qaHealth?.pagesRegistered || 0,
+        workerFleetSize: qaHealth?.workerFleetSize || 0,
+      },
+      evolution: {
+        scans: evolutionScans.results || [],
+      },
+      lowestHealth: (workerProfiles.results || []).slice(0, 5),
+      recentActions: recentActions.results || [],
+    }), { headers: corsHeaders });
+  }
+
   // ─── /stats ───
   if (path === '/stats') {
     const days = parseInt(url.searchParams.get('days') || '7');

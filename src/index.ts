@@ -3070,6 +3070,74 @@ const CORS_HEADERS = {
         }
       }
 
+      // ── HARDENING: Add root route handler (/ → /health redirect or JSON) ──
+      if (finding.includes('root route') || finding.includes('404 on /') || finding.includes('missing root')) {
+        const hasRootRoute = /app\.get\s*\(\s*['"]\/['"]/.test(modifiedContent) || /path\s*===?\s*['"]\/['"]/.test(modifiedContent) || /pathname\s*===?\s*['"]\/['"]/.test(modifiedContent);
+        if (!hasRootRoute) {
+          // Detect if Hono or raw Worker
+          const isHono = /from\s+['"]hono['"]/.test(modifiedContent) || /new\s+Hono/.test(modifiedContent);
+          if (isHono) {
+            // Insert after last app.use(...) or after app creation
+            const lastUseIdx = modifiedContent.lastIndexOf('app.use(');
+            if (lastUseIdx > -1) {
+              const afterUse = modifiedContent.indexOf(');', lastUseIdx);
+              if (afterUse > -1) {
+                const insertPoint = afterUse + 2;
+                const rootRoute = `\n// Root route (auto-added by Evolution Engine)\napp.get('/', (c) => c.redirect('/health'));\n`;
+                modifiedContent = modifiedContent.slice(0, insertPoint) + rootRoute + modifiedContent.slice(insertPoint);
+                fixDescription = 'Added root route handler (/ → /health redirect)';
+              }
+            }
+          } else {
+            // Raw Worker — insert before first route handler
+            const fetchIdx = modifiedContent.indexOf('async fetch(');
+            if (fetchIdx > -1) {
+              const bodyStart = modifiedContent.indexOf('{', fetchIdx);
+              if (bodyStart > -1) {
+                const insertPoint = bodyStart + 1;
+                const rootRoute = `\n    // Root route (auto-added by Evolution Engine)\n    const _url = new URL(request.url);\n    if (_url.pathname === '/') return new Response(JSON.stringify({ status: 'ok', service: '${repo}' }), { headers: { 'Content-Type': 'application/json' } });\n`;
+                modifiedContent = modifiedContent.slice(0, insertPoint) + rootRoute + modifiedContent.slice(insertPoint);
+                fixDescription = 'Added root route handler (/ → JSON status)';
+              }
+            }
+          }
+        }
+      }
+
+      // ── OPTIMIZATION: Replace console.log with structured JSON logging ──
+      if (finding.includes('console.log') || finding.includes('structured logging')) {
+        // Match console.log(...) calls that aren't already JSON.stringify
+        const consoleLogRegex = /console\.log\((?!JSON\.stringify)([^)]{1,200})\)/g;
+        let logCount = 0;
+        modifiedContent = modifiedContent.replace(consoleLogRegex, (match, inner) => {
+          // Skip if already structured or is a health/status response
+          if (inner.includes('JSON.stringify') || inner.includes('json(')) return match;
+          logCount++;
+          const cleanInner = inner.replace(/'/g, "\\'").replace(/`/g, '\\`').trim();
+          // If it's a template literal or variable, use it as the msg
+          if (cleanInner.startsWith('`') || cleanInner.startsWith("'") || cleanInner.startsWith('"')) {
+            return `console.log(JSON.stringify({ ts: new Date().toISOString(), level: 'info', msg: ${inner.trim()}, service: '${repo}' }))`;
+          }
+          return `console.log(JSON.stringify({ ts: new Date().toISOString(), level: 'info', msg: String(${inner.trim()}), service: '${repo}' }))`;
+        });
+        // Also fix console.error and console.warn
+        const consoleErrorRegex = /console\.error\((?!JSON\.stringify)([^)]{1,200})\)/g;
+        modifiedContent = modifiedContent.replace(consoleErrorRegex, (match, inner) => {
+          if (inner.includes('JSON.stringify')) return match;
+          logCount++;
+          return `console.log(JSON.stringify({ ts: new Date().toISOString(), level: 'error', msg: String(${inner.trim()}), service: '${repo}' }))`;
+        });
+        const consoleWarnRegex = /console\.warn\((?!JSON\.stringify)([^)]{1,200})\)/g;
+        modifiedContent = modifiedContent.replace(consoleWarnRegex, (match, inner) => {
+          if (inner.includes('JSON.stringify')) return match;
+          logCount++;
+          return `console.log(JSON.stringify({ ts: new Date().toISOString(), level: 'warn', msg: String(${inner.trim()}), service: '${repo}' }))`;
+        });
+        if (logCount > 0) {
+          fixDescription = `Replaced ${logCount} console.log/error/warn calls with structured JSON logging`;
+        }
+      }
+
       // ── UPGRADE: Still on v1.0.0 ──
       if (finding.includes('Still on v1.0.0')) {
         // Just log — version bumps need human review
@@ -3322,7 +3390,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'placeholder_data_fixing', 'json_ld_faq_fixing', 'structured_data_fixing',
         'seo_metadata_fixing', 'broken_link_fixing', 'stale_api_fixing',
         'error_boundary_fixing', 'accessibility_triaging', 'unclassified_bug_fixing',
-        'false_positive_detection', 'low_severity_auto_triage', 'nav_auto_resolve'
+        'false_positive_detection', 'low_severity_auto_triage', 'nav_auto_resolve',
+        // v3.1 structured logging + root route auto-fix
+        'structured_logging_auto_fix', 'root_route_auto_fix'
       ]
     }), { headers: corsHeaders });
   }

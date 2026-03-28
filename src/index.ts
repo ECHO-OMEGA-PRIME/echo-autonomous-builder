@@ -1,5 +1,5 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.11.0 — "Infrastructure Anomaly Detector"
+ * ECHO AUTONOMOUS BUILDER v3.12.0 — "Rolling Uptime + Noise Reduction"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
@@ -3923,14 +3923,17 @@ async function detectLatencyDegradation(env: Env, cid: string): Promise<{ analyz
     // Prune old latency data (keep 14 days)
     env.DB.prepare("DELETE FROM latency_history WHERE recorded_at < datetime('now', '-14 days')").run().catch(() => {});
 
-    await logAction(env.DB, {
-      action_type: 'latency_analysis',
-      target: `${analyzed} workers`,
-      details: `Analyzed ${analyzed} workers with sufficient baseline data. ${degraded.length} degraded.`,
-      result: degraded.length > 0 ? 'degradation_detected' : 'healthy',
-      duration_ms: 0,
-      cycle_id: cid
-    });
+    // Only log when degradation detected — suppress healthy logs to reduce noise
+    if (degraded.length > 0) {
+      await logAction(env.DB, {
+        action_type: 'latency_analysis',
+        target: `${analyzed} workers`,
+        details: `Analyzed ${analyzed} workers. ${degraded.length} degraded: ${degraded.join(', ')}`,
+        result: 'degradation_detected',
+        duration_ms: 0,
+        cycle_id: cid
+      });
+    }
 
   } catch (e: any) {
     await logAction(env.DB, {
@@ -5226,7 +5229,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'api_endpoint_verification', 'auth_protection_audit', 'error_handling_audit',
         'adaptive_cold_start_warmup',
         'fleet_changelog_generation', 'version_drift_detection',
-        'infrastructure_anomaly_detection', 'on_demand_fleet_report'
+        'infrastructure_anomaly_detection', 'on_demand_fleet_report',
+        'rolling_uptime_7day', 'profile_rebaseline'
       ]
     }), { headers: corsHeaders });
   }
@@ -5351,10 +5355,18 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       ? Math.round(profiles.reduce((s, w) => s + (w.avg_latency_ms || 0), 0) / profiles.length)
       : 0;
 
-    // Uptime calc: healthy / total checks
-    const totalChecks = profiles.reduce((s, w) => s + (w.check_count || 0), 0);
-    const totalHealthy = profiles.reduce((s, w) => s + (w.healthy_count || 0), 0);
-    const uptimePct = totalChecks > 0 ? ((totalHealthy / totalChecks) * 100).toFixed(2) : '100.00';
+    // Uptime calc: rolling 7-day window from latency_history (not all-time profiles)
+    // All-time profiles include historical cold-start failures that drag the average.
+    let uptimePct = '100.00';
+    try {
+      const uptimeData = await env.DB.prepare(
+        `SELECT COUNT(*) as total, SUM(CASE WHEN healthy = 1 THEN 1 ELSE 0 END) as healthy_cnt
+         FROM latency_history WHERE recorded_at > datetime('now', '-7 days')`
+      ).first() as any;
+      if (uptimeData?.total > 0) {
+        uptimePct = ((uptimeData.healthy_cnt / uptimeData.total) * 100).toFixed(2);
+      }
+    } catch { /* fallback to 100% if table doesn't exist */ }
 
     const report = {
       service: 'echo-autonomous-builder',
@@ -5528,6 +5540,25 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       `SELECT * FROM worker_profiles ORDER BY health_score ASC`
     ).all();
     return new Response(JSON.stringify({ workers: profiles.results }), { headers: corsHeaders });
+  }
+
+  // ─── /rebaseline ─── Reset worker_profiles counters (POST only, auth required)
+  // Resets check_count and healthy_count to 0 so uptime starts fresh.
+  // Useful when historical cold-start failures drag the all-time uptime average.
+  if (path === '/rebaseline' && request.method === 'POST') {
+    if (!authOk) return new Response('Unauthorized', { status: 401 });
+    await env.DB.prepare(
+      `UPDATE worker_profiles SET check_count = 0, healthy_count = 0`
+    ).run();
+    await logAction(env.DB, {
+      action_type: 'rebaseline',
+      target: 'worker_profiles',
+      details: 'Reset all check_count and healthy_count to 0. All-time uptime rebaselined.',
+      result: 'success',
+      duration_ms: 0,
+      cycle_id: cycleId()
+    });
+    return new Response(JSON.stringify({ success: true, message: 'Worker profiles rebaselined. check_count and healthy_count reset to 0.' }), { headers: corsHeaders });
   }
 
   // ─── /queue ───
@@ -5791,7 +5822,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       'GET /config', 'POST /run', 'POST /run/warmup', 'POST /run/hunt',
       'POST /config',
       'GET /evolution/activity', 'GET /evolution/scans', 'GET /evolution/projects',
-      'GET /evolution/changes', 'GET /evolution/sandbox'
+      'GET /evolution/changes', 'GET /evolution/sandbox',
+      'GET /report', 'GET /infra-anomaly', 'GET /cron-health', 'GET /drift',
+      'GET /fleet-overview', 'POST /rebaseline'
     ]
   }), { status: 404, headers: corsHeaders });
 }

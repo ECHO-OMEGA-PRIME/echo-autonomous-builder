@@ -274,7 +274,8 @@ const ALL_MONITORED_WORKERS = [...new Set([
   'echo-ab-testing-engine', 'echo-coin-rewards', 'echo-documents',
   'echo-workflows', 'echo-invoicing', 'echo-appointments',
   'echo-hr-management', 'echo-project-management',
-  'echo-vendor-manager'
+  'echo-vendor-manager',
+  'echo-runway'
 ])];
 
 const KNOWN_REDIRECT_PAGES = [

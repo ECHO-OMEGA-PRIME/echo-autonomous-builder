@@ -375,3 +375,7 @@ service = "echo-knowledge-scout"
 [[services]]
 binding = "SVC_CRONORCH"
 service = "echo-cron-orchestrator"
+
+[[services]]
+binding = "SVC_RUNWAY"
+service = "echo-runway"

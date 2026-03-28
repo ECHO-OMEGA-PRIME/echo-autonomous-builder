@@ -552,6 +552,22 @@ async function initDB(db: D1Database): Promise<void> {
     created_at TEXT DEFAULT (datetime('now')),
     UNIQUE(worker_name, endpoint, method)
   )`).run().catch(() => {});
+
+  // MODULE 38: Error Correlation Engine (v3.29)
+  await db.prepare(`CREATE TABLE IF NOT EXISTS error_correlations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    correlation_id TEXT NOT NULL,
+    window_start TEXT NOT NULL,
+    window_end TEXT NOT NULL,
+    workers_affected INTEGER DEFAULT 0,
+    worker_list TEXT,
+    pattern_type TEXT DEFAULT 'unknown',
+    severity TEXT DEFAULT 'medium',
+    root_cause_guess TEXT,
+    resolved INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`).run().catch(() => {});
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_error_corr_time ON error_correlations (created_at)`).run().catch(() => {});
 }
 
 // ═══════════════════════════════════════════════════
@@ -7075,6 +7091,165 @@ async function catalogWorkerEndpoints(env: Env, cid: string): Promise<CatalogRes
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 38: Cross-Worker Error Correlation Engine
+// Detects when multiple workers fail simultaneously
+// within the same time window, indicating shared
+// dependency failures or infrastructure incidents.
+// ═══════════════════════════════════════════════════
+
+interface CorrelationResult {
+  analyzed: number;
+  correlations: Array<{
+    id: string;
+    workers: string[];
+    windowStart: string;
+    windowEnd: string;
+    pattern: string;
+    severity: string;
+    rootCause: string;
+  }>;
+  incidents: number;
+}
+
+async function detectErrorCorrelations(env: Env, cid: string): Promise<CorrelationResult> {
+  const result: CorrelationResult = { analyzed: 0, correlations: [], incidents: 0 };
+
+  try {
+    // Fetch all unhealthy probes from the last 4 hours
+    const failures = await env.DB.prepare(`
+      SELECT worker_name, latency_ms, status_code, recorded_at
+      FROM latency_history
+      WHERE healthy = 0
+        AND recorded_at > datetime('now', '-4 hours')
+      ORDER BY recorded_at ASC
+    `).all();
+
+    const rows = (failures.results || []) as any[];
+    result.analyzed = rows.length;
+    if (rows.length < 2) return result; // Need at least 2 failures to correlate
+
+    // Bucket failures into 5-minute windows
+    const buckets = new Map<string, { workers: Set<string>; start: string; end: string; codes: Map<string, number> }>();
+
+    for (const row of rows) {
+      const ts = new Date(row.recorded_at + 'Z').getTime();
+      const bucketKey = String(Math.floor(ts / (5 * 60 * 1000))); // 5-min buckets
+      if (!buckets.has(bucketKey)) {
+        const bucketStart = new Date(Math.floor(ts / (5 * 60 * 1000)) * 5 * 60 * 1000).toISOString();
+        const bucketEnd = new Date(Math.floor(ts / (5 * 60 * 1000)) * 5 * 60 * 1000 + 5 * 60 * 1000).toISOString();
+        buckets.set(bucketKey, { workers: new Set(), start: bucketStart, end: bucketEnd, codes: new Map() });
+      }
+      const b = buckets.get(bucketKey)!;
+      b.workers.add(row.worker_name);
+      const code = String(row.status_code || 0);
+      b.codes.set(code, (b.codes.get(code) || 0) + 1);
+    }
+
+    // Find buckets with correlated failures (3+ workers failing in same window)
+    const CORRELATION_THRESHOLD = 3;
+    const newCorrelations: typeof result.correlations = [];
+
+    for (const [, bucket] of buckets) {
+      if (bucket.workers.size < CORRELATION_THRESHOLD) continue;
+
+      const workerList = Array.from(bucket.workers).sort();
+      const correlationId = `corr_${cid}_${bucket.start.replace(/[^0-9]/g, '').slice(0, 12)}`;
+
+      // Classify the pattern
+      let pattern = 'simultaneous';
+      let severity = 'medium';
+      let rootCause = 'Multiple workers failed in same window';
+
+      // Check if all failures share the same status code (infra issue)
+      const dominantCode = [...bucket.codes.entries()].sort((a, b) => b[1] - a[1])[0];
+      if (dominantCode) {
+        const codeNum = parseInt(dominantCode[0]);
+        if (codeNum === 0 || codeNum === 522 || codeNum === 524) {
+          pattern = 'network';
+          severity = 'high';
+          rootCause = `Network/timeout issue (code ${dominantCode[0]}) affecting ${workerList.length} workers`;
+        } else if (codeNum === 502 || codeNum === 503) {
+          pattern = 'overload';
+          severity = 'high';
+          rootCause = `Gateway overload (${dominantCode[0]}) — possible Cloudflare edge issue`;
+        } else if (codeNum >= 500) {
+          pattern = 'cascading';
+          severity = 'critical';
+          rootCause = `Server errors (${dominantCode[0]}) across ${workerList.length} workers — possible shared dependency failure`;
+        }
+      }
+
+      // Check for shared service bindings (from topology data)
+      if (workerList.length > 5) {
+        pattern = 'infrastructure';
+        severity = 'critical';
+        rootCause = `${workerList.length} workers failed simultaneously — likely Cloudflare platform incident`;
+      }
+
+      newCorrelations.push({
+        id: correlationId,
+        workers: workerList,
+        windowStart: bucket.start,
+        windowEnd: bucket.end,
+        pattern,
+        severity,
+        rootCause,
+      });
+    }
+
+    // Dedup: only store correlations not already in D1 (check window overlap)
+    for (const corr of newCorrelations) {
+      const existing = await env.DB.prepare(
+        `SELECT id FROM error_correlations
+         WHERE window_start = ? AND workers_affected = ?
+         AND created_at > datetime('now', '-4 hours')`
+      ).bind(corr.windowStart, corr.workers.length).first();
+
+      if (!existing) {
+        await env.DB.prepare(
+          `INSERT INTO error_correlations (correlation_id, window_start, window_end, workers_affected, worker_list, pattern_type, severity, root_cause_guess)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+        ).bind(corr.id, corr.windowStart, corr.windowEnd, corr.workers.length,
+          JSON.stringify(corr.workers), corr.pattern, corr.severity, corr.rootCause).run();
+        result.correlations.push(corr);
+        result.incidents++;
+      }
+    }
+
+    // Alert on critical correlations
+    if (result.correlations.some(c => c.severity === 'critical')) {
+      const criticals = result.correlations.filter(c => c.severity === 'critical');
+      await reportToBrain(env,
+        `CRITICAL ERROR CORRELATION: ${criticals.length} incident(s) detected. ` +
+        criticals.map(c => `${c.workers.length} workers (${c.pattern}): ${c.rootCause}`).join(' | '),
+        9, ['error-correlation', 'critical', 'incident']
+      ).catch(() => {});
+    }
+
+    await logAction(env.DB, {
+      action_type: 'error_correlation',
+      target: 'fleet',
+      details: `Analyzed ${result.analyzed} failures across ${buckets.size} windows. Found ${result.incidents} new correlations (${result.correlations.filter(c => c.severity === 'critical').length} critical)`,
+      result: result.incidents > 0 ? 'detected' : 'clean',
+      duration_ms: 0,
+      cycle_id: cid,
+    });
+
+  } catch (e: any) {
+    await logAction(env.DB, {
+      action_type: 'error_correlation',
+      target: 'fleet',
+      details: `Error: ${e.message}`,
+      result: 'error',
+      duration_ms: 0,
+      cycle_id: cid,
+    });
+  }
+
+  return result;
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -7118,8 +7293,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const cronHealth = await monitorCronHealth(env, cid);
       const deployRegress = await detectDeployRegressions(env, cid);
       const autoRecovery = await autoRecoverSLAViolations(env, cid);
+      const errorCorrelation30 = await detectErrorCorrelations(env, cid);
 
-      const summary = `Cycle ${cid}: QA processed=${qaResult.processed} autoResolved=${qaResult.autoResolved} queued=${qaResult.queued} | Daemon processed=${daemonResult.processed} resolved=${daemonResult.resolved} | Fixes attempted=${fixResult.attempted} fixed=${fixResult.fixed} failed=${fixResult.failed} | EvoFixes fixed=${evoFixResult.fixed}/${evoFixResult.attempted} failed=${evoFixResult.failed} | Verify: ${verifyResult.verified} checked, ${verifyResult.issues.length} issues | CronHealth: ${cronHealth.healthy}/${cronHealth.checked} healthy, ${cronHealth.stale.length} stale | DeployRegress: ${deployRegress.regressions.length}/${deployRegress.checked} regressions | AutoRecovery: ${autoRecovery.recovered}/${autoRecovery.attempted} recovered, ${autoRecovery.escalated} escalated`;
+      const summary = `Cycle ${cid}: QA processed=${qaResult.processed} autoResolved=${qaResult.autoResolved} queued=${qaResult.queued} | Daemon processed=${daemonResult.processed} resolved=${daemonResult.resolved} | Fixes attempted=${fixResult.attempted} fixed=${fixResult.fixed} failed=${fixResult.failed} | EvoFixes fixed=${evoFixResult.fixed}/${evoFixResult.attempted} failed=${evoFixResult.failed} | Verify: ${verifyResult.verified} checked, ${verifyResult.issues.length} issues | CronHealth: ${cronHealth.healthy}/${cronHealth.checked} healthy, ${cronHealth.stale.length} stale | DeployRegress: ${deployRegress.regressions.length}/${deployRegress.checked} regressions | AutoRecovery: ${autoRecovery.recovered}/${autoRecovery.attempted} recovered, ${autoRecovery.escalated} escalated | ErrorCorrelation: ${errorCorrelation30.incidents} incidents`;
 
       await logAction(env.DB, {
         action_type: 'cycle_30min',
@@ -7172,8 +7348,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const topology = await mapFleetTopology(env, cid);
       const deployRegress4h = await detectDeployRegressions(env, cid);
       const endpointCatalog = await catalogWorkerEndpoints(env, cid);
+      const errorCorrelation = await detectErrorCorrelations(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations | Contracts: ${contractTests.passed}/${contractTests.total} passed | Revenue: ${revenueReport.revenueReadyCount}/${revenueReport.productsChecked} ready, $${revenueReport.potentialMRR} potential MRR, ${revenueReport.subscriptions.activeTrials} trials, ${revenueReport.subscriptions.activePaid} paid | DoctrineGOLD: ${doctrineAudit.goldPct}% sample, ${doctrineAudit.forgeTriggered} re-forged | Security: ${securityAudit.scanned} scanned, ${securityAudit.findings.length} findings (${securityAudit.findings.filter(f => f.severity === 'critical').length} critical) | Topology: ${topology.workers} workers, ${topology.edges} edges, ${topology.circularDeps.length} circular, ${topology.criticalNodes[0]?.worker || 'none'} top dependency | DeployRegress: ${deployRegress4h.regressions.length}/${deployRegress4h.checked} regressions | EndpointCatalog: ${endpointCatalog.discovered} endpoints from ${endpointCatalog.scanned} workers`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations | Contracts: ${contractTests.passed}/${contractTests.total} passed | Revenue: ${revenueReport.revenueReadyCount}/${revenueReport.productsChecked} ready, $${revenueReport.potentialMRR} potential MRR, ${revenueReport.subscriptions.activeTrials} trials, ${revenueReport.subscriptions.activePaid} paid | DoctrineGOLD: ${doctrineAudit.goldPct}% sample, ${doctrineAudit.forgeTriggered} re-forged | Security: ${securityAudit.scanned} scanned, ${securityAudit.findings.length} findings (${securityAudit.findings.filter(f => f.severity === 'critical').length} critical) | Topology: ${topology.workers} workers, ${topology.edges} edges, ${topology.circularDeps.length} circular, ${topology.criticalNodes[0]?.worker || 'none'} top dependency | DeployRegress: ${deployRegress4h.regressions.length}/${deployRegress4h.checked} regressions | EndpointCatalog: ${endpointCatalog.discovered} endpoints from ${endpointCatalog.scanned} workers | ErrorCorrelation: ${errorCorrelation.incidents} new incidents from ${errorCorrelation.analyzed} failures`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -7283,6 +7460,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         contractTests: '/contract-tests',
         topology: '/topology',
         topologyImpact: '/topology/impact/:worker',
+        errorCorrelations: '/error-correlations',
       }
     }), { headers: corsHeaders });
   }
@@ -7381,7 +7559,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'rolling_uptime_7day', 'profile_rebaseline', 'kv_cron_alert_dedup',
         'sla_compliance_monitoring', 'latency_percentile_dashboard',
         'api_contract_testing',
-        'fleet_topology_mapping', 'circular_dependency_detection', 'impact_analysis'
+        'fleet_topology_mapping', 'circular_dependency_detection', 'impact_analysis',
+        'cross_worker_error_correlation', 'incident_pattern_detection'
       ]
     }), { headers: corsHeaders });
   }
@@ -8185,6 +8364,47 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     const cid = cycleId();
     const result = await autoRecoverSLAViolations(env, cid);
     return new Response(JSON.stringify(result), { headers: corsHeaders });
+  }
+
+  // ─── GET /error-correlations ─── Cross-worker error correlation incidents
+  if (path === '/error-correlations' && request.method === 'GET') {
+    const limit = parseInt(url.searchParams.get('limit') || '50');
+    const severity = url.searchParams.get('severity');
+    const unresolved = url.searchParams.get('unresolved') === 'true';
+
+    let query = 'SELECT * FROM error_correlations WHERE 1=1';
+    const params: any[] = [];
+    if (severity) { query += ' AND severity = ?'; params.push(severity); }
+    if (unresolved) { query += ' AND resolved = 0'; }
+    query += ' ORDER BY created_at DESC LIMIT ?';
+    params.push(limit);
+
+    const rows = await env.DB.prepare(query).bind(...params).all();
+    const summary = await env.DB.prepare(`
+      SELECT severity, COUNT(*) as count, SUM(CASE WHEN resolved = 0 THEN 1 ELSE 0 END) as unresolved
+      FROM error_correlations
+      WHERE created_at > datetime('now', '-7 days')
+      GROUP BY severity
+    `).all();
+
+    return new Response(JSON.stringify({
+      correlations: (rows.results || []).map((r: any) => ({
+        ...r,
+        worker_list: r.worker_list ? JSON.parse(r.worker_list) : [],
+      })),
+      summary: {
+        total: (rows.results || []).length,
+        bySeverity: summary.results || [],
+      },
+      timestamp: new Date().toISOString(),
+    }), { headers: corsHeaders });
+  }
+
+  // ─── POST /error-correlations (manual trigger) ───
+  if (path === '/error-correlations' && request.method === 'POST') {
+    const cid = cycleId();
+    const result = await detectErrorCorrelations(env, cid);
+    return new Response(JSON.stringify({ ...result, timestamp: new Date().toISOString() }), { headers: corsHeaders });
   }
 
   // ─── POST /config ───

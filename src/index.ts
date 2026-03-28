@@ -492,7 +492,16 @@ async function initDB(db: D1Database): Promise<void> {
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_actions_created ON actions_log (created_at)`),
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_actions_type_target ON actions_log (action_type, target)`),
     db.prepare(`CREATE INDEX IF NOT EXISTS idx_fixqueue_status ON fix_queue (status, created_at)`),
-    db.prepare(`CREATE INDEX IF NOT EXISTS idx_evolution_status ON evolution_scans (status, created_at)`)
+    db.prepare(`CREATE INDEX IF NOT EXISTS idx_evolution_status ON evolution_scans (status, created_at)`),
+    db.prepare(`CREATE TABLE IF NOT EXISTS contract_tests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      run_id TEXT NOT NULL,
+      total INTEGER DEFAULT 0,
+      passed INTEGER DEFAULT 0,
+      failed INTEGER DEFAULT 0,
+      results_json TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )`)
   ]);
 }
 
@@ -4998,19 +5007,24 @@ const SLA_TIERS: Record<string, SLATier> = {
 };
 
 const WORKER_TIER_MAP: Record<string, string> = {
-  // Tier: fast — simple KV/static workers
+  // Tier: fast — simple KV/static workers, single D1 query
   'echo-doctrine-forge': 'fast', 'echo-qa-tester': 'fast', 'echo-analytics-engine': 'fast',
   'echo-telegram': 'fast', 'echo-autonomous-daemon': 'fast', 'echo-config-manager': 'fast',
   'echo-alert-router': 'fast', 'echo-rate-limiter': 'fast', 'echo-cost-optimizer': 'fast',
-  'echo-health-dashboard': 'fast', 'echo-feature-flags': 'fast',
-  // Tier: heavy — complex D1 queries, multi-table
+  'echo-health-dashboard': 'fast', 'echo-feature-flags': 'fast', 'echo-status-page': 'fast',
+  'echo-email-sender': 'fast', 'echo-link-shortener': 'fast', 'echo-waitlist': 'fast',
+  // Tier: standard — typical D1 CRUD, moderate complexity (default for unlisted workers)
+  // Tier: heavy — complex D1 queries, multi-table joins, external API calls
   'echo-engine-runtime': 'heavy', 'echo-knowledge-forge': 'heavy', 'echo-arcanum': 'heavy',
   'echo-build-orchestrator': 'heavy', 'echo-coin-rewards': 'heavy', 'echo-recruiting': 'heavy',
   'echo-darkweb-intelligence': 'heavy', 'echo-call-center': 'heavy',
-  // Tier: aggregator — fan-out to multiple services
+  'echo-vault-api': 'heavy', 'echo-document-manager': 'heavy',
+  'echo-vendor-manager': 'heavy', 'echo-compliance': 'heavy', 'echo-payroll': 'heavy',
+  // Tier: aggregator — fan-out to multiple services, high cold-start latency
   'echo-shared-brain': 'aggregator', 'echo-sdk-gateway': 'aggregator',
   'echo-swarm-brain': 'aggregator', 'echo-reddit-bot': 'aggregator',
   'echo-intel-hub': 'aggregator', 'echo-chat': 'aggregator',
+  'echo-autonomous-builder': 'aggregator',
   // Everything else = standard
 };
 
@@ -5269,20 +5283,25 @@ Requirements:
       model: 'sonnet'
     });
 
+    const engineAuthHeaders: Record<string, string> = {
+      'Content-Type': 'application/json',
+      'X-Echo-API-Key': env.ECHO_API_KEY || 'echo-omega-prime-forge-x-2026'
+    };
     const engineResp = env.SVC_ENGINE
       ? await env.SVC_ENGINE.fetch('https://internal/query/reason', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: engineAuthHeaders,
           body: engineBody
         })
       : await fetchWithTimeout(`${ENGINE_URL}/query/reason`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: engineAuthHeaders,
           body: engineBody
         }, 60000);
 
     if (!engineResp.ok) {
-      return { generated: false, error: `Engine Runtime ${engineResp.status}` };
+      const errBody = await engineResp.text().catch(() => '');
+      return { generated: false, error: `Engine Runtime ${engineResp.status}: ${errBody.slice(0, 100)}` };
     }
 
     const engineData = await engineResp.json() as any;
@@ -5460,6 +5479,128 @@ Requirements:
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 30: CROSS-WORKER API CONTRACT TESTING
+// Verifies critical service-to-service integrations
+// beyond simple health checks — tests real API contracts
+// Runs every 4 hours alongside full audit cycle
+// ═══════════════════════════════════════════════════
+
+interface ContractTest {
+  name: string;
+  service: string;
+  binding: string;
+  method: string;
+  path: string;
+  expectedStatus: number;
+  expectedFields?: string[];
+  timeout: number;
+}
+
+const API_CONTRACT_TESTS: ContractTest[] = [
+  { name: 'engine-runtime-health', service: 'echo-engine-runtime', binding: 'SVC_ENGINE', method: 'GET', path: '/health', expectedStatus: 200, expectedFields: ['engines', 'doctrines'], timeout: 5000 },
+  { name: 'engine-runtime-query', service: 'echo-engine-runtime', binding: 'SVC_ENGINE', method: 'GET', path: '/engines?domain=TX&limit=3', expectedStatus: 200, expectedFields: ['engines'], timeout: 8000 },
+  { name: 'shared-brain-search', service: 'echo-shared-brain', binding: 'SVC_BRAIN', method: 'POST', path: '/search', expectedStatus: 200, expectedFields: ['results'], timeout: 10000 },
+  { name: 'knowledge-forge-health', service: 'echo-knowledge-forge', binding: 'SVC_KNOWLEDGE', method: 'GET', path: '/health', expectedStatus: 200, expectedFields: ['status'], timeout: 5000 },
+  { name: 'doctrine-forge-health', service: 'echo-doctrine-forge', binding: 'SVC_DOCTRINE', method: 'GET', path: '/health', expectedStatus: 200, expectedFields: ['status'], timeout: 5000 },
+  { name: 'sdk-gateway-health', service: 'echo-sdk-gateway', binding: 'SVC_SDK', method: 'GET', path: '/health', expectedStatus: 200, expectedFields: ['status'], timeout: 8000 },
+  { name: 'vault-api-accessible', service: 'echo-vault-api', binding: 'SVC_VAULT', method: 'GET', path: '/health', expectedStatus: 200, timeout: 5000 },
+  { name: 'crm-pipelines', service: 'echo-crm', binding: 'SVC_CRM', method: 'GET', path: '/pipelines', expectedStatus: 200, expectedFields: ['pipelines'], timeout: 5000 },
+  { name: 'analytics-dashboard', service: 'echo-analytics-engine', binding: 'SVC_ANALYTICS', method: 'GET', path: '/dashboard', expectedStatus: 200, timeout: 5000 },
+  { name: 'daemon-fleet-score', service: 'echo-autonomous-daemon', binding: 'SVC_DAEMON', method: 'GET', path: '/health', expectedStatus: 200, expectedFields: ['fleetScore'], timeout: 5000 },
+];
+
+interface ContractTestResult {
+  name: string;
+  service: string;
+  passed: boolean;
+  statusCode: number;
+  latencyMs: number;
+  error?: string;
+  missingFields?: string[];
+}
+
+async function runAPIContractTests(env: Env, cid: string): Promise<{
+  total: number; passed: number; failed: number; results: ContractTestResult[];
+}> {
+  const results: ContractTestResult[] = [];
+
+  for (const test of API_CONTRACT_TESTS) {
+    const start = Date.now();
+    const binding = (env as any)[test.binding] as Fetcher | undefined;
+
+    if (!binding) {
+      results.push({ name: test.name, service: test.service, passed: false, statusCode: 0, latencyMs: 0, error: `Missing binding: ${test.binding}` });
+      continue;
+    }
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), test.timeout);
+
+      const reqInit: RequestInit = {
+        method: test.method,
+        signal: controller.signal,
+        headers: { 'User-Agent': 'echo-autonomous-builder/contract-test' },
+      };
+
+      if (test.method === 'POST') {
+        (reqInit.headers as Record<string, string>)['Content-Type'] = 'application/json';
+        if (test.path === '/search') reqInit.body = JSON.stringify({ query: 'contract test ping', limit: 1 });
+      }
+
+      const res = await binding.fetch(new Request(`https://internal${test.path}`, reqInit));
+      clearTimeout(timeoutId);
+      const latencyMs = Date.now() - start;
+
+      if (res.status !== test.expectedStatus) {
+        results.push({ name: test.name, service: test.service, passed: false, statusCode: res.status, latencyMs, error: `Expected ${test.expectedStatus}, got ${res.status}` });
+        continue;
+      }
+
+      if (test.expectedFields && test.expectedFields.length > 0) {
+        try {
+          const body = await res.json() as Record<string, unknown>;
+          const missingFields = test.expectedFields.filter(f => !(f in body));
+          if (missingFields.length > 0) {
+            results.push({ name: test.name, service: test.service, passed: false, statusCode: res.status, latencyMs, missingFields });
+            continue;
+          }
+        } catch {
+          results.push({ name: test.name, service: test.service, passed: false, statusCode: res.status, latencyMs, error: 'Response not valid JSON' });
+          continue;
+        }
+      }
+
+      results.push({ name: test.name, service: test.service, passed: true, statusCode: res.status, latencyMs });
+    } catch (e: any) {
+      const latencyMs = Date.now() - start;
+      results.push({ name: test.name, service: test.service, passed: false, statusCode: 0, latencyMs, error: e.name === 'AbortError' ? `Timeout (${test.timeout}ms)` : e.message });
+    }
+  }
+
+  const passed = results.filter(r => r.passed).length;
+  const failed = results.filter(r => !r.passed).length;
+
+  await logAction(env.DB, {
+    action_type: 'contract_test_run',
+    target: 'fleet',
+    details: JSON.stringify({ total: results.length, passed, failed, failures: results.filter(r => !r.passed).map(r => ({ name: r.name, error: r.error || r.missingFields })) }),
+    result: failed === 0 ? 'success' : 'partial',
+    duration_ms: results.reduce((s, r) => s + r.latencyMs, 0),
+    cycle_id: cid,
+  });
+
+  // Store for trend tracking
+  try {
+    await env.DB.prepare(
+      "INSERT INTO contract_tests (run_id, total, passed, failed, results_json, created_at) VALUES (?, ?, ?, ?, ?, datetime('now'))"
+    ).bind(cid, results.length, passed, failed, JSON.stringify(results)).run();
+  } catch { /* table may not exist yet */ }
+
+  return { total: results.length, passed, failed, results };
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -5548,8 +5689,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       // Reuse that result — don't double-call and risk duplicate stale alerts
       const infraAnomaly = await detectInfrastructureAnomaly(env, cid);
       const slaCompliance = await checkSLACompliance(env, cid);
+      const contractTests = await runAPIContractTests(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations | Contracts: ${contractTests.passed}/${contractTests.total} passed`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -5650,7 +5792,30 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         drift: '/drift',
         cronHealth: '/cron-health',
         fleetOverview: '/fleet-overview',
+        runBlog: 'POST /run/blog (?force=true to bypass daily dedup)',
+        sla: '/sla',
+        contractTests: '/contract-tests',
       }
+    }), { headers: corsHeaders });
+  }
+
+  // ─── /contract-tests ─── Run or view API contract test results
+  if (path === '/contract-tests') {
+    if (request.method === 'POST') {
+      const cid = cycleId();
+      const result = await runAPIContractTests(env, cid);
+      return new Response(JSON.stringify({ ...result, timestamp: new Date().toISOString() }), { headers: corsHeaders });
+    }
+    // GET — return recent results
+    const recent = await env.DB.prepare(
+      `SELECT * FROM contract_tests ORDER BY created_at DESC LIMIT 10`
+    ).all();
+    return new Response(JSON.stringify({
+      results: (recent.results || []).map((r: any) => ({
+        ...r,
+        results_json: r.results_json ? JSON.parse(r.results_json) : null
+      })),
+      timestamp: new Date().toISOString()
     }), { headers: corsHeaders });
   }
 
@@ -5726,7 +5891,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'fleet_changelog_generation', 'version_drift_detection',
         'infrastructure_anomaly_detection', 'on_demand_fleet_report',
         'rolling_uptime_7day', 'profile_rebaseline', 'kv_cron_alert_dedup',
-        'sla_compliance_monitoring', 'latency_percentile_dashboard'
+        'sla_compliance_monitoring', 'latency_percentile_dashboard',
+        'api_contract_testing'
       ]
     }), { headers: corsHeaders });
   }
@@ -6311,6 +6477,18 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     const cid = cycleId();
     const results = await huntBugs(env, cid);
     return new Response(JSON.stringify({ cycleId: cid, ...results }), { headers: corsHeaders });
+  }
+
+  // ─── POST /run/blog — manually trigger auto-blog generation ───
+  if (path === '/run/blog' && request.method === 'POST') {
+    const cid = cycleId();
+    // Clear today's dedup so manual trigger works even if cron already ran
+    const force = new URL(request.url).searchParams.get('force') === 'true';
+    if (force) {
+      await env.CACHE.delete(`auto_blog_${today()}`);
+    }
+    const result = await generateAutoBlog(env, cid);
+    return new Response(JSON.stringify({ cycleId: cid, ...result }), { headers: corsHeaders });
   }
 
   // ─── POST /config ───

@@ -1,5 +1,5 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.6.0 — "API Endpoint Verifier"
+ * ECHO AUTONOMOUS BUILDER v3.7.0 — "Adaptive Cold-Start Warmup"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
@@ -2576,7 +2576,8 @@ async function generateDailyBriefing(env: Env, cid: string): Promise<string> {
   // ── Gather all data in parallel ──
   const [
     stats, yesterdayStats, recentActions, pendingFixes, completedFixes, failedFixes,
-    workerStats, topWorkers, bottomWorkers, degradedCount, pendingEvolution, uniqueVersions
+    workerStats, topWorkers, bottomWorkers, degradedCount, pendingEvolution, uniqueVersions,
+    verifyCount, adaptiveCount
   ] = await Promise.all([
     env.DB.prepare(`SELECT * FROM daily_stats WHERE date = ?`).bind(d).first(),
     env.DB.prepare(`SELECT * FROM daily_stats WHERE date = date(?, '-1 day')`).bind(d).first(),
@@ -2589,7 +2590,9 @@ async function generateDailyBriefing(env: Env, cid: string): Promise<string> {
     env.DB.prepare(`SELECT worker_name, health_score, avg_latency_ms FROM worker_profiles WHERE check_count > 5 ORDER BY health_score ASC LIMIT 3`).all(),
     env.DB.prepare(`SELECT COUNT(DISTINCT worker_name) as cnt FROM latency_history WHERE recorded_at > datetime('now', '-24 hours') AND healthy = 0`).first() as Promise<any>,
     env.DB.prepare(`SELECT COUNT(*) as cnt FROM evolution_scans WHERE status = 'detected'`).first() as Promise<any>,
-    env.DB.prepare(`SELECT last_version, COUNT(*) as cnt FROM worker_profiles WHERE last_version IS NOT NULL AND last_version != '' GROUP BY last_version ORDER BY cnt DESC`).all()
+    env.DB.prepare(`SELECT last_version, COUNT(*) as cnt FROM worker_profiles WHERE last_version IS NOT NULL AND last_version != '' GROUP BY last_version ORDER BY cnt DESC`).all(),
+    env.DB.prepare(`SELECT COUNT(*) as cnt FROM actions_log WHERE action_type = 'endpoint_verify' AND created_at > datetime('now', '-24 hours')`).first() as Promise<any>,
+    env.DB.prepare(`SELECT COUNT(*) as cnt FROM actions_log WHERE action_type = 'adaptive_warmup' AND created_at > datetime('now', '-24 hours')`).first() as Promise<any>
   ]);
 
   // ── Trend arrows (compare today vs yesterday) ──
@@ -2679,7 +2682,8 @@ FIX QUEUE: ${pendingFixes?.cnt || 0} pending | ${completedFixes?.cnt || 0} fixed
 EVOLUTION: ${pendingEvolution?.cnt || 0} pending findings
 FLEET: ${workerStats?.total || 0} workers | Avg latency: ${todayLatency}ms${trend(todayLatency, yesterdayLatency)} | Avg health: ${Math.round(workerStats?.avgHealth || 0)}%
 VERSIONS: ${versionLine}
-COLD-START INCIDENTS (24h): ${degradedCount?.cnt || 0} workers had ≥1 unhealthy check
+COLD-START INCIDENTS (24h): ${degradedCount?.cnt || 0} workers had ≥1 unhealthy check | Adaptive warmups: ${adaptiveCount?.cnt || 0}
+ENDPOINT VERIFICATION: ${verifyCount?.cnt || 0} deep checks (24h)
 ${engineLine ? `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n${engineLine}` : ''}${doctrineLine ? `\n${doctrineLine}` : ''}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 TOP PERFORMERS:
@@ -4130,6 +4134,66 @@ async function verifyEndpoints(env: Env, cid: string): Promise<{ verified: numbe
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 23: ADAPTIVE COLD-START WARMUP
+// Workers with recent cold starts get extra warmups
+// ═══════════════════════════════════════════════════
+
+async function adaptiveColdStartWarmup(env: Env, cid: string): Promise<{ warmed: number; targets: string[] }> {
+  try {
+    // Find workers with unhealthy checks in the last 2 hours that aren't in the regular warmup list
+    const coldStartWorkers = await env.DB.prepare(`
+      SELECT worker_name, COUNT(*) as cold_count
+      FROM latency_history
+      WHERE healthy = 0
+        AND recorded_at > datetime('now', '-2 hours')
+      GROUP BY worker_name
+      HAVING cold_count >= 1
+      ORDER BY cold_count DESC
+      LIMIT 15
+    `).all();
+
+    if (!coldStartWorkers.results?.length) {
+      return { warmed: 0, targets: [] };
+    }
+
+    // Filter out workers already in CRITICAL_WORKERS (they get warmed every 5 min anyway)
+    const criticalSet = new Set(CRITICAL_WORKERS);
+    const extraTargets = (coldStartWorkers.results as any[])
+      .map(r => r.worker_name as string)
+      .filter(w => !criticalSet.has(w) && SERVICE_BINDING_MAP[w] && env[SERVICE_BINDING_MAP[w]]);
+
+    if (extraTargets.length === 0) {
+      return { warmed: 0, targets: [] };
+    }
+
+    // Warm these cold-start-prone workers
+    const results = await warmUpWorkers(env, cid, extraTargets);
+    const warmed = results.filter(r => r.healthy).length;
+
+    await logAction(env.DB, {
+      action_type: 'adaptive_warmup',
+      target: `${extraTargets.length} cold-start workers`,
+      details: `Warmed ${warmed}/${extraTargets.length} cold-start-prone workers: ${extraTargets.join(', ')}`,
+      result: warmed === extraTargets.length ? 'all_healthy' : 'some_unhealthy',
+      duration_ms: 0,
+      cycle_id: cid
+    });
+
+    return { warmed, targets: extraTargets };
+  } catch (e: any) {
+    await logAction(env.DB, {
+      action_type: 'adaptive_warmup',
+      target: 'cold-start workers',
+      details: `Error: ${e.message}`,
+      result: 'error',
+      duration_ms: 0,
+      cycle_id: cid
+    });
+    return { warmed: 0, targets: [] };
+  }
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -4156,6 +4220,11 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
     // ═══ EVERY 5 MINUTES: Warm up critical workers ═══
     if (minute % 5 === 0) {
       ctx.waitUntil(warmUpWorkers(env, cid));
+    }
+
+    // ═══ EVERY 15 MINUTES: Adaptive cold-start warmup for repeat offenders ═══
+    if (minute % 15 === 0 && minute % 30 !== 0) {
+      ctx.waitUntil(adaptiveColdStartWarmup(env, cid));
     }
 
     // ═══ EVERY 30 MINUTES: Process QA bugs + daemon tasks + execute fixes ═══
@@ -4284,6 +4353,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         latency: '/latency',
         latencyDegraded: '/latency/degraded',
         verify: '/verify',
+        adaptive: '/adaptive',
       }
     }), { headers: corsHeaders });
   }
@@ -4355,7 +4425,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'diagnostics_bridge', 'diagnostics_auto_resolve',
         'latency_monitoring', 'latency_degradation_detection',
         'dependency_audit', 'fleet_trend_analysis', 'stale_data_pruning',
-        'api_endpoint_verification', 'auth_protection_audit', 'error_handling_audit'
+        'api_endpoint_verification', 'auth_protection_audit', 'error_handling_audit',
+        'adaptive_cold_start_warmup'
       ]
     }), { headers: corsHeaders });
   }
@@ -4436,6 +4507,18 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       authProtectedWorkers: AUTH_PROTECTED_WORKERS.length,
       reachableWorkers: AUTH_PROTECTED_WORKERS.filter(w => SERVICE_BINDING_MAP[w]).length,
       recentVerifications: recent.results
+    }), { headers: corsHeaders });
+  }
+
+  // ─── /adaptive ───
+  if (path === '/adaptive') {
+    const recent = await env.DB.prepare(
+      `SELECT * FROM actions_log WHERE action_type = 'adaptive_warmup' ORDER BY created_at DESC LIMIT 10`
+    ).all();
+    return new Response(JSON.stringify({
+      service: 'echo-autonomous-builder',
+      description: 'Adaptive Cold-Start Warmup — extra warmups for repeat cold-start workers',
+      recentAdaptiveWarmups: recent.results
     }), { headers: corsHeaders });
   }
 

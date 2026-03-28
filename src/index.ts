@@ -1,5 +1,5 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.13.0 — "Cron Alert Dedup Hardening"
+ * ECHO AUTONOMOUS BUILDER v3.14.0 — "Visual Dashboard"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
@@ -5814,6 +5814,140 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     return new Response(JSON.stringify({ tests: rows.results }), { headers: corsHeaders });
   }
 
+  // ─── /dashboard ─── Visual HTML dashboard ───
+  if (path === '/dashboard') {
+    const html = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ECHO Autonomous Builder — Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:#0a0a0a;color:#e0e0e0;font-family:'Segoe UI',system-ui,sans-serif;padding:20px}
+h1{color:#ff6b35;font-size:1.8rem;margin-bottom:4px}
+.sub{color:#9932cc;font-size:.9rem;margin-bottom:20px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin-bottom:20px}
+.card{background:#111;border:1px solid #222;border-radius:10px;padding:16px}
+.card h2{color:#8b008b;font-size:1rem;margin-bottom:10px;text-transform:uppercase;letter-spacing:1px}
+.metric{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1a1a1a}
+.metric:last-child{border:none}
+.label{color:#888}
+.value{color:#e0e0e0;font-weight:600;font-variant-numeric:tabular-nums}
+.value.good{color:#22c55e} .value.warn{color:#f59e0b} .value.bad{color:#ef4444}
+.bar{height:6px;background:#222;border-radius:3px;margin-top:4px;overflow:hidden}
+.bar-fill{height:100%;border-radius:3px;transition:width .5s}
+.bar-fill.g{background:linear-gradient(90deg,#22c55e,#16a34a)}
+.bar-fill.y{background:linear-gradient(90deg,#f59e0b,#d97706)}
+.bar-fill.r{background:linear-gradient(90deg,#ef4444,#dc2626)}
+.cron-row{display:flex;align-items:center;gap:8px;padding:4px 0}
+.dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+.dot.green{background:#22c55e} .dot.red{background:#ef4444} .dot.yellow{background:#f59e0b}
+.cron-name{font-size:.85rem;color:#aaa}
+.footer{text-align:center;color:#444;font-size:.75rem;margin-top:20px}
+.refresh{color:#555;font-size:.8rem;float:right}
+.lat-bar{display:flex;align-items:center;gap:8px;padding:3px 0}
+.lat-name{width:140px;font-size:.8rem;color:#888;text-overflow:ellipsis;overflow:hidden;white-space:nowrap}
+.lat-val{font-size:.8rem;color:#aaa;width:60px;text-align:right}
+.lat-track{flex:1;height:4px;background:#1a1a1a;border-radius:2px;overflow:hidden}
+.lat-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,#22c55e,#f59e0b)}
+#error{display:none;background:#2d1010;border:1px solid #ef4444;padding:12px;border-radius:8px;margin-bottom:16px;color:#fca5a5}
+</style></head><body>
+<div style="display:flex;justify-content:space-between;align-items:baseline">
+<h1>ECHO Autonomous Builder</h1>
+<span class="refresh" id="timer">Refreshing in 60s</span>
+</div>
+<div class="sub" id="version">Loading...</div>
+<div id="error"></div>
+<div class="grid" id="main">
+  <div class="card" id="fleet-card"><h2>Fleet Health</h2><div id="fleet">Loading...</div></div>
+  <div class="card" id="activity-card"><h2>Today's Activity</h2><div id="activity">Loading...</div></div>
+  <div class="card" id="infra-card"><h2>Infrastructure</h2><div id="infra">Loading...</div></div>
+  <div class="card" id="cron-card"><h2>Cron Health</h2><div id="crons">Loading...</div></div>
+  <div class="card" id="latency-card"><h2>Top Latency</h2><div id="latency">Loading...</div></div>
+  <div class="card" id="engine-card"><h2>Engine Runtime</h2><div id="engines">Loading...</div></div>
+</div>
+<div class="footer">ECHO OMEGA PRIME — Autonomous Builder Dashboard — Auto-refreshes every 60s</div>
+<script>
+const BASE='';
+let countdown=60;
+function m(l,v,cls){return '<div class="metric"><span class="label">'+l+'</span><span class="value'+(cls?' '+cls:'')+'">'+v+'</span></div>'}
+function bar(pct,cls){return '<div class="bar"><div class="bar-fill '+(cls||'g')+'" style="width:'+Math.min(pct,100)+'%"></div></div>'}
+function cls(v,g,w){return v>=g?'good':v>=w?'warn':'bad'}
+async function load(){
+  try{
+    const r=await fetch(BASE+'/report');
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    const s=d.summary||{};
+    const a=d.todayActivity||{};
+    const inf=d.infrastructure||{};
+    const cr=d.cronHealth||{};
+    const tl=d.topLatency||[];
+    const er=d.engineRuntime||{};
+    const df=d.doctrineForge||{};
+    document.getElementById('error').style.display='none';
+    document.getElementById('version').textContent='v'+s.builderVersion+' | '+s.totalWorkers+' workers monitored | Generated '+new Date(d.generatedAt).toLocaleTimeString();
+    // Fleet
+    const up=parseFloat(s.uptimePercent||100);
+    document.getElementById('fleet').innerHTML=
+      m('Fleet Score',s.fleetScore+'/100',cls(s.fleetScore,95,80))+
+      m('Workers Online',s.healthyWorkers+'/'+s.totalWorkers,s.healthyWorkers===s.totalWorkers?'good':'bad')+
+      m('Uptime (7-day)',up.toFixed(2)+'%',cls(up,99,95))+
+      bar(up,up>=99?'g':up>=95?'y':'r')+
+      m('Avg Latency',s.avgFleetLatencyMs+'ms',cls(500-s.avgFleetLatencyMs,200,0))+
+      m('Pending Fixes',s.pendingFixes,s.pendingFixes===0?'good':'warn');
+    // Activity
+    document.getElementById('activity').innerHTML=
+      m('Warmups',a.warmups?.toLocaleString()||0)+
+      m('Bugs Found',a.bugsFound?.toLocaleString()||0)+
+      m('Auto-Resolved',a.bugsAutoResolved?.toLocaleString()||0,'good')+
+      m('Bugs Fixed',a.bugsFixed?.toLocaleString()||0,'good')+
+      m('Tasks Resolved',a.tasksResolved?.toLocaleString()||0)+
+      m('Deploys',a.deploys||0)+
+      m('Pages Fixed',a.pagesFixed||0);
+    // Infra
+    const ic=inf.anomalyClassification||'unknown';
+    document.getElementById('infra').innerHTML=
+      m('Status',ic.toUpperCase(),ic==='healthy'?'good':'bad')+
+      m('Degraded',inf.degradedPercent+'%',inf.degradedPercent===0?'good':'bad')+
+      m('Fleet Latency',inf.currentFleetLatency+'ms')+
+      m('Baseline',inf.baselineFleetLatency+'ms')+
+      m('Recommendation',inf.recommendation||'—');
+    // Crons
+    let ch='';
+    const targets=cr.staleTargets||[];
+    ch+='<div style="margin-bottom:8px;font-size:.9rem;color:'+(cr.healthy===cr.checked?'#22c55e':'#ef4444')+'">'+cr.healthy+'/'+cr.checked+' healthy</div>';
+    // Show all 10 cron targets
+    const cronNames=['echo-doctrine-forge','echo-autonomous-daemon','echo-qa-tester','echo-bot-auditor','echo-knowledge-scout','echo-cron-orchestrator','echo-email-marketing','echo-calendar','echo-workflow-automation','echo-autonomous-builder'];
+    cronNames.forEach(n=>{
+      const isStale=targets.some(t=>t.includes(n));
+      ch+='<div class="cron-row"><span class="dot '+(isStale?'red':'green')+'"></span><span class="cron-name">'+n.replace('echo-','')+'</span></div>';
+    });
+    document.getElementById('crons').innerHTML=ch;
+    // Top Latency
+    const maxLat=Math.max(...tl.map(t=>t.avg_ms||0),1);
+    let lh='';
+    tl.slice(0,8).forEach(t=>{
+      const pct=Math.round((t.avg_ms/maxLat)*100);
+      lh+='<div class="lat-bar"><span class="lat-name">'+t.worker_name.replace('echo-','')+'</span><div class="lat-track"><div class="lat-fill" style="width:'+pct+'%;background:'+(t.avg_ms>3000?'#ef4444':t.avg_ms>1000?'#f59e0b':'#22c55e')+'"></div></div><span class="lat-val">'+Math.round(t.avg_ms)+'ms</span></div>';
+    });
+    document.getElementById('latency').innerHTML=lh||'<span style="color:#555">No data</span>';
+    // Engine Runtime
+    document.getElementById('engines').innerHTML=
+      m('Engines',er.engines?.toLocaleString()||'—')+
+      m('Doctrines',er.doctrines?.toLocaleString()||'—')+
+      m('Queries',er.queries?.toLocaleString()||'—')+
+      m('Forge Status',(df.complete||0)+'/'+(df.total||0)+' complete',(df.complete===df.total&&df.total>0)?'good':'warn')+
+      m('Generated',df.generated?.toLocaleString()||'—');
+  }catch(e){
+    document.getElementById('error').textContent='Failed to load: '+e.message;
+    document.getElementById('error').style.display='block';
+  }
+}
+load();
+setInterval(()=>{countdown--;document.getElementById('timer').textContent='Refreshing in '+countdown+'s';if(countdown<=0){countdown=60;load();}},1000);
+</script></body></html>`;
+    return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', ...Object.fromEntries(Object.entries(corsHeaders).filter(([k]) => k !== 'Content-Type')) } });
+  }
+
   // ─── 404 ───
   return new Response(JSON.stringify({
     error: 'Not found',
@@ -5825,7 +5959,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       'GET /evolution/activity', 'GET /evolution/scans', 'GET /evolution/projects',
       'GET /evolution/changes', 'GET /evolution/sandbox',
       'GET /report', 'GET /infra-anomaly', 'GET /cron-health', 'GET /drift',
-      'GET /fleet-overview', 'POST /rebaseline'
+      'GET /fleet-overview', 'POST /rebaseline', 'GET /dashboard'
     ]
   }), { status: 404, headers: corsHeaders });
 }

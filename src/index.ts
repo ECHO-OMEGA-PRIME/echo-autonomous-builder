@@ -3943,7 +3943,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       builder: {
         version: env.WORKER_VERSION,
         todayStats: builderStats || {},
-        capabilities: 18,
+        capabilities: 28,
       },
       daemon: {
         version: daemonHealth?.version || 'unknown',

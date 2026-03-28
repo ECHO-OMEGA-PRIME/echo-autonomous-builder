@@ -2024,7 +2024,7 @@ export const metadata: Metadata = {
 
 async function fixBrokenLink(env: Env, pagePath: string, detailsJson: string, cid: string): Promise<boolean> {
   let details: any = {};
-  try { details = JSON.parse(detailsJson); } catch {}
+  try { details = JSON.parse(detailsJson); } catch (e) { console.warn(JSON.stringify({ ts: new Date().toISOString(), level: 'warn', worker: 'echo-autonomous-builder', message: 'fixBrokenLink JSON parse failed', error: (e as Error)?.message })); }
 
   const evidence = details.evidence || '';
 
@@ -2129,7 +2129,7 @@ async function fixBrokenLink(env: Env, pagePath: string, detailsJson: string, ci
 
 async function fixStaleApi(env: Env, pagePath: string, detailsJson: string, cid: string): Promise<boolean> {
   let details: any = {};
-  try { details = JSON.parse(detailsJson); } catch {}
+  try { details = JSON.parse(detailsJson); } catch (e) { console.warn(JSON.stringify({ ts: new Date().toISOString(), level: 'warn', worker: 'echo-autonomous-builder', message: 'fixStaleApi JSON parse failed', error: (e as Error)?.message })); }
 
   const evidence = details.evidence || '';
 
@@ -2305,7 +2305,7 @@ export default function ${productName.split('-').map((w: string) => w.charAt(0).
 
 async function fixUnclassified(env: Env, pagePath: string, detailsJson: string, cid: string): Promise<boolean> {
   let details: any = {};
-  try { details = JSON.parse(detailsJson); } catch {}
+  try { details = JSON.parse(detailsJson); } catch (e) { console.warn(JSON.stringify({ ts: new Date().toISOString(), level: 'warn', worker: 'echo-autonomous-builder', message: 'fixUnclassified JSON parse failed', error: (e as Error)?.message })); }
 
   const title = details.title || '';
   const evidence = details.evidence || '';
@@ -2434,7 +2434,7 @@ async function reportToBrain(env: Env, content: string, importance: number = 7, 
         body
       }, 5000);
     }
-  } catch {}
+  } catch (e) { console.warn(JSON.stringify({ ts: new Date().toISOString(), level: 'warn', worker: 'echo-autonomous-builder', message: 'Shared Brain ingest failed', error: (e as Error)?.message })); }
 }
 
 async function postToMoltBook(env: Env, content: string, mood: string = 'building', tags: string[] = ['auto-builder']): Promise<void> {
@@ -2460,7 +2460,7 @@ async function postToMoltBook(env: Env, content: string, mood: string = 'buildin
         body
       }, 5000);
     }
-  } catch {}
+  } catch (e) { console.warn(JSON.stringify({ ts: new Date().toISOString(), level: 'warn', worker: 'echo-autonomous-builder', message: 'MoltBook post failed', error: (e as Error)?.message })); }
 }
 
 // ═══════════════════════════════════════════════════
@@ -2527,7 +2527,7 @@ ${(recentActions.results || []).slice(0, 10).map((a: any) => `  ${a.created_at} 
         body: JSON.stringify({ message: briefing })
       }, 5000);
     }
-  } catch {}
+  } catch (e) { console.warn(JSON.stringify({ ts: new Date().toISOString(), level: 'warn', worker: 'echo-autonomous-builder', message: 'OmniSync briefing broadcast failed', error: (e as Error)?.message })); }
 
   return briefing;
 }
@@ -2885,7 +2885,7 @@ async function checkForProjectOpportunities(env: Env, cid: string): Promise<{ op
               created++;
             }
           }
-        } catch {}
+        } catch (e) { console.warn(JSON.stringify({ ts: new Date().toISOString(), level: 'warn', worker: 'echo-autonomous-builder', message: 'project suggestion insert failed', error: (e as Error)?.message })); }
       }
     }
 

@@ -3808,6 +3808,110 @@ async function auditDependencies(env: Env, cid: string): Promise<{ scanned: numb
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 20: FLEET HEALTH TREND ANALYZER
+// ═══════════════════════════════════════════════════
+
+interface TrendReport {
+  analyzed: number;
+  degrading: string[];
+  improving: string[];
+  frequentColdStarts: string[];
+  p95Anomalies: string[];
+  alerts: string[];
+}
+
+async function analyzeFleetTrends(env: Env, cid: string): Promise<TrendReport> {
+  const report: TrendReport = { analyzed: 0, degrading: [], improving: [], frequentColdStarts: [], p95Anomalies: [], alerts: [] };
+
+  try {
+    // Get all workers with enough data points (at least 10 checks)
+    const workers = await env.DB.prepare(
+      `SELECT worker_name, avg_latency_ms, health_score, check_count, healthy_count FROM worker_profiles WHERE check_count >= 10`
+    ).all();
+
+    if (!workers.results?.length) return report;
+    report.analyzed = workers.results.length;
+
+    for (const w of workers.results as any[]) {
+      const name = w.worker_name;
+
+      // ── Trend detection: compare last-6h avg vs previous-6h avg ──
+      const recent = await env.DB.prepare(
+        `SELECT AVG(latency_ms) as avg_lat, COUNT(*) as cnt, SUM(CASE WHEN healthy = 0 THEN 1 ELSE 0 END) as unhealthy
+         FROM latency_history WHERE worker_name = ? AND recorded_at > datetime('now', '-6 hours')`
+      ).bind(name).first() as any;
+
+      const previous = await env.DB.prepare(
+        `SELECT AVG(latency_ms) as avg_lat, COUNT(*) as cnt, SUM(CASE WHEN healthy = 0 THEN 1 ELSE 0 END) as unhealthy
+         FROM latency_history WHERE worker_name = ? AND recorded_at > datetime('now', '-12 hours') AND recorded_at <= datetime('now', '-6 hours')`
+      ).bind(name).first() as any;
+
+      if (recent?.cnt >= 3 && previous?.cnt >= 3) {
+        const recentAvg = recent.avg_lat || 0;
+        const prevAvg = previous.avg_lat || 0;
+
+        // Degrading: recent avg is 50%+ higher than previous
+        if (prevAvg > 0 && recentAvg > prevAvg * 1.5 && recentAvg > 300) {
+          report.degrading.push(`${name}: ${Math.round(prevAvg)}ms → ${Math.round(recentAvg)}ms (+${Math.round((recentAvg/prevAvg - 1) * 100)}%)`);
+        }
+        // Improving: recent avg is 30%+ lower
+        if (prevAvg > 300 && recentAvg < prevAvg * 0.7) {
+          report.improving.push(`${name}: ${Math.round(prevAvg)}ms → ${Math.round(recentAvg)}ms (-${Math.round((1 - recentAvg/prevAvg) * 100)}%)`);
+        }
+      }
+
+      // ── Frequent cold starts: >3 unhealthy checks in last 12h ──
+      const coldStarts = await env.DB.prepare(
+        `SELECT COUNT(*) as cnt FROM latency_history WHERE worker_name = ? AND healthy = 0 AND recorded_at > datetime('now', '-12 hours')`
+      ).bind(name).first() as any;
+
+      if (coldStarts?.cnt > 3) {
+        report.frequentColdStarts.push(`${name}: ${coldStarts.cnt} cold starts in 12h`);
+      }
+
+      // ── P95 anomaly: any single check > 3x the worker's avg ──
+      const spikes = await env.DB.prepare(
+        `SELECT MAX(latency_ms) as max_lat FROM latency_history WHERE worker_name = ? AND recorded_at > datetime('now', '-6 hours') AND latency_ms > ?`
+      ).bind(name, (w.avg_latency_ms || 100) * 3).first() as any;
+
+      if (spikes?.max_lat) {
+        report.p95Anomalies.push(`${name}: spike ${spikes.max_lat}ms (avg ${Math.round(w.avg_latency_ms)}ms)`);
+      }
+    }
+
+    // Generate alerts for critical patterns
+    if (report.degrading.length > 3) {
+      report.alerts.push(`FLEET TREND: ${report.degrading.length} workers degrading simultaneously — possible infrastructure issue`);
+    }
+    if (report.frequentColdStarts.length > 5) {
+      report.alerts.push(`COLD START PATTERN: ${report.frequentColdStarts.length} workers with frequent cold starts`);
+    }
+
+    // Store results
+    await logAction(env.DB, {
+      action_type: 'fleet_trend_analysis',
+      target: 'fleet',
+      details: `Analyzed ${report.analyzed} workers. ${report.degrading.length} degrading, ${report.improving.length} improving, ${report.frequentColdStarts.length} frequent cold starts, ${report.p95Anomalies.length} P95 anomalies.`,
+      result: report.alerts.length > 0 ? 'alert' : 'clean',
+      duration_ms: 0,
+      cycle_id: cid
+    });
+
+    // Report alerts to Brain
+    if (report.alerts.length > 0) {
+      await reportToBrain(env, `FLEET TREND ALERT: ${report.alerts.join(' | ')}`, 8, ['fleet', 'trend', 'alert']);
+    } else if (report.degrading.length > 0 || report.frequentColdStarts.length > 0) {
+      await reportToBrain(env, `FLEET TRENDS: ${report.degrading.length} degrading (${report.degrading.join(', ')}), ${report.frequentColdStarts.length} cold-start issues`, 6, ['fleet', 'trend']);
+    }
+
+  } catch (e: any) {
+    await logAction(env.DB, { action_type: 'fleet_trend_analysis', target: 'fleet', details: `Error: ${e.message}`, result: 'error', duration_ms: 0, cycle_id: cid });
+  }
+
+  return report;
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -3883,8 +3987,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const diagBridge = await bridgeDiagnosticsFindings(env, cid);
       const latencyCheck = await detectLatencyDegradation(env, cid);
       const depAudit = await auditDependencies(env, cid);
+      const trendReport = await analyzeFleetTrends(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -4028,7 +4133,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'structured_logging_auto_fix', 'root_route_auto_fix',
         'diagnostics_bridge', 'diagnostics_auto_resolve',
         'latency_monitoring', 'latency_degradation_detection',
-        'dependency_audit'
+        'dependency_audit', 'fleet_trend_analysis'
       ]
     }), { headers: corsHeaders });
   }
@@ -4047,6 +4152,54 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       pendingFixes: pending.results,
       recentActions: recent.results,
       lowestHealthWorkers: workers.results
+    }), { headers: corsHeaders });
+  }
+
+  // ─── /trends ───
+  if (path === '/trends') {
+    const hours = parseInt(url.searchParams.get('hours') || '24');
+
+    // Get latency trend data per worker
+    const trendData = await env.DB.prepare(
+      `SELECT worker_name,
+              MIN(latency_ms) as min_lat,
+              MAX(latency_ms) as max_lat,
+              AVG(latency_ms) as avg_lat,
+              COUNT(*) as checks,
+              SUM(CASE WHEN healthy = 0 THEN 1 ELSE 0 END) as unhealthy_checks
+       FROM latency_history
+       WHERE recorded_at > datetime('now', '-' || ? || ' hours')
+       GROUP BY worker_name
+       ORDER BY avg_lat DESC`
+    ).bind(hours).all();
+
+    // Get recent trend analysis results
+    const recentAnalysis = await env.DB.prepare(
+      `SELECT * FROM actions_log WHERE action_type = 'fleet_trend_analysis' ORDER BY created_at DESC LIMIT 5`
+    ).all();
+
+    // Compute fleet-wide stats
+    const rows = trendData.results as any[];
+    const fleetAvg = rows.length > 0 ? Math.round(rows.reduce((s, r) => s + (r.avg_lat || 0), 0) / rows.length) : 0;
+    const totalColdStarts = rows.reduce((s, r) => s + (r.unhealthy_checks || 0), 0);
+    const degraded = rows.filter(r => (r.avg_lat || 0) > 500);
+
+    return new Response(JSON.stringify({
+      service: 'echo-autonomous-builder',
+      period: `${hours}h`,
+      fleetAverageLatency: fleetAvg,
+      totalColdStarts,
+      workersAnalyzed: rows.length,
+      degradedWorkers: degraded.map(r => ({ name: r.worker_name, avgLatency: Math.round(r.avg_lat), maxLatency: r.max_lat, coldStarts: r.unhealthy_checks })),
+      workerTrends: rows.map(r => ({
+        name: r.worker_name,
+        avgLatency: Math.round(r.avg_lat || 0),
+        minLatency: r.min_lat,
+        maxLatency: r.max_lat,
+        checks: r.checks,
+        coldStarts: r.unhealthy_checks || 0
+      })),
+      recentAnalysis: recentAnalysis.results
     }), { headers: corsHeaders });
   }
 

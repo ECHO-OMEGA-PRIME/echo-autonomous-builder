@@ -2650,6 +2650,23 @@ async function generateDailyBriefing(env: Env, cid: string): Promise<string> {
     setStat(env.DB, 'fleet_health_score', Math.round(workerStats?.avgHealth || 0))
   ]);
 
+  // ── Run trend analysis for the briefing ──
+  let trendSection = '';
+  try {
+    const trendReport = await analyzeFleetTrends(env, cid);
+    const parts: string[] = [];
+    if (trendReport.degrading.length > 0) parts.push(`DEGRADING: ${trendReport.degrading.join(', ')}`);
+    if (trendReport.improving.length > 0) parts.push(`IMPROVING: ${trendReport.improving.join(', ')}`);
+    if (trendReport.frequentColdStarts.length > 0) parts.push(`COLD-START REPEAT: ${trendReport.frequentColdStarts.join(', ')}`);
+    if (trendReport.p95Anomalies.length > 0) parts.push(`P95 SPIKES: ${trendReport.p95Anomalies.join(', ')}`);
+    if (trendReport.alerts.length > 0) parts.push(`ALERTS: ${trendReport.alerts.join(', ')}`);
+    if (parts.length > 0) {
+      trendSection = `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nTREND ANALYSIS (${trendReport.analyzed} workers):\n${parts.map(p => `  ${p}`).join('\n')}`;
+    } else {
+      trendSection = `━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\nTREND ANALYSIS: All ${trendReport.analyzed} workers stable — no anomalies detected`;
+    }
+  } catch { trendSection = ''; }
+
   const briefing = `DAILY AUTONOMOUS BUILDER BRIEFING — ${d}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WARMUPS: ${todayWarmups} pings${trend(todayWarmups, yesterdayWarmups)}
@@ -2668,6 +2685,7 @@ ${engineLine ? `━━━━━━━━━━━━━━━━━━━━━�
 TOP PERFORMERS:
 ${topList || '  (insufficient data)'}
 ${bottomList ? `NEEDS ATTENTION:\n${bottomList}` : 'ALL WORKERS HEALTHY (95%+)'}
+${trendSection}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RECENT ACTIONS:
 ${(recentActions.results || []).slice(0, 10).map((a: any) => `  ${a.created_at} | ${a.action_type} → ${a.target} [${a.result}]`).join('\n')}`;

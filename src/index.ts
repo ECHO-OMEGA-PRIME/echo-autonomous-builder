@@ -1,10 +1,10 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.19.0 — "Tiered SLA Thresholds"
+ * ECHO AUTONOMOUS BUILDER v3.20.0 — "Auto-Blog Writer"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
  *
- * 27 Modules:
+ * 29 Modules:
  * 1. Worker Warmer — keeps critical workers warm, eliminates cold-start latency alerts
  * 2. QA Bug Processor — auto-resolves false positives, queues real fixes
  * 3. Daemon Task Resolver — resolves pending performance tasks
@@ -32,13 +32,15 @@
  * 25. Cron Health Monitor — detects when cron-based Workers stop executing
  * 26. Infrastructure Anomaly Detector — distinguishes fleet-wide CF issues from individual worker issues
  * 27. On-Demand Fleet Report — comprehensive /report endpoint for instant fleet status
+ * 28. SLA Compliance Monitor — tiered uptime/latency thresholds per worker class
+ * 29. Auto-Blog Writer — generates daily SEO blog articles via Engine Runtime + GitHub push
  *
  * Cron Schedule:
  * - every 5 min: warm up critical workers + quick health pulse
  * - every 15 min (offset): adaptive cold-start warmup for repeat offenders
  * - every 30 min: QA bug triage + daemon tasks + auto-fixes + endpoint verify
  * - every 4 hours: full system audit + bug hunt + evolution + diagnostics + trends
- * - daily 8am: daily briefing + changelog + pruning
+ * - daily 8am: daily briefing + changelog + pruning + auto-blog
  */
 
 interface Env {
@@ -5182,6 +5184,282 @@ async function checkSLACompliance(env: Env, cid: string): Promise<SLAResult> {
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 29: AUTO-BLOG WRITER
+// Generates SEO blog articles via Engine Runtime and pushes to EPT GitHub
+// Runs daily at 8am UTC alongside briefing
+// ═══════════════════════════════════════════════════
+
+const BLOG_TOPICS: Array<{
+  domain: string;
+  category: string;
+  promptTheme: string;
+  tags: string[];
+}> = [
+  { domain: 'TX', category: 'Tax Intelligence', promptTheme: 'tax strategy for small business owners', tags: ['tax', 'small-business', 'IRS'] },
+  { domain: 'TX', category: 'Tax Intelligence', promptTheme: 'IRS audit defense strategies', tags: ['tax', 'audit', 'IRS', 'defense'] },
+  { domain: 'LG', category: 'AI & Engineering', promptTheme: 'AI contract review automating legal workflows', tags: ['legal', 'AI', 'contracts', 'automation'] },
+  { domain: 'LM', category: 'Oilfield Tech', promptTheme: 'digital title examination replacing manual processes', tags: ['landman', 'title', 'oil-gas', 'digital'] },
+  { domain: 'DRL', category: 'Oilfield Tech', promptTheme: 'drilling optimization with AI and real-time data', tags: ['drilling', 'AI', 'optimization', 'oil-gas'] },
+  { domain: 'SEC', category: 'Security', promptTheme: 'zero trust architecture for small and mid-size businesses', tags: ['security', 'zero-trust', 'cybersecurity', 'SMB'] },
+  { domain: 'SEC', category: 'Security', promptTheme: 'ransomware incident response playbook', tags: ['security', 'ransomware', 'incident-response'] },
+  { domain: 'GEN', category: 'AI & Engineering', promptTheme: 'building AI agents with Cloudflare Workers', tags: ['AI', 'agents', 'cloudflare', 'workers'] },
+  { domain: 'GEN', category: 'AI & Engineering', promptTheme: 'multi-tenant SaaS architecture patterns', tags: ['SaaS', 'architecture', 'multi-tenant'] },
+  { domain: 'GEN', category: 'Product Updates', promptTheme: 'AI-powered business automation replacing manual workflows', tags: ['AI', 'automation', 'business', 'efficiency'] },
+  { domain: 'RE', category: 'AI & Engineering', promptTheme: 'AI in real estate valuation and property analysis', tags: ['real-estate', 'AI', 'valuation'] },
+  { domain: 'TX', category: 'Tax Intelligence', promptTheme: 'cryptocurrency tax reporting and compliance', tags: ['crypto', 'tax', 'compliance', 'IRS'] },
+  { domain: 'LG', category: 'AI & Engineering', promptTheme: 'AI regulatory compliance tracking for enterprises', tags: ['compliance', 'AI', 'regulation', 'enterprise'] },
+  { domain: 'DRL', category: 'Oilfield Tech', promptTheme: 'artificial lift optimization using predictive analytics', tags: ['artificial-lift', 'optimization', 'AI', 'oil-gas'] },
+  { domain: 'GEN', category: 'AI & Engineering', promptTheme: 'edge computing and AI inference at the edge', tags: ['edge', 'AI', 'cloudflare', 'inference'] },
+  { domain: 'SEC', category: 'Security', promptTheme: 'API security testing and OWASP best practices', tags: ['API', 'security', 'OWASP', 'testing'] },
+  { domain: 'GEN', category: 'Product Updates', promptTheme: 'AI helpdesk and customer support automation', tags: ['helpdesk', 'AI', 'customer-support', 'automation'] },
+  { domain: 'TX', category: 'Tax Intelligence', promptTheme: 'oil and gas tax deductions operators miss', tags: ['oil-gas', 'tax', 'deductions', 'operators'] },
+  { domain: 'GEN', category: 'AI & Engineering', promptTheme: 'AI document processing and intelligent extraction', tags: ['documents', 'AI', 'OCR', 'extraction'] },
+  { domain: 'LM', category: 'Oilfield Tech', promptTheme: 'mineral rights acquisition strategy and due diligence', tags: ['minerals', 'landman', 'acquisition', 'oil-gas'] },
+];
+
+interface AutoBlogResult {
+  generated: boolean;
+  slug?: string;
+  title?: string;
+  error?: string;
+  skippedReason?: string;
+}
+
+async function generateAutoBlog(env: Env, cid: string): Promise<AutoBlogResult> {
+  // Guard: need GitHub token
+  if (!env.GITHUB_TOKEN) {
+    return { generated: false, error: 'No GITHUB_TOKEN' };
+  }
+
+  // Dedup: only one blog per day
+  const todayStr = today();
+  const dedupKey = `auto_blog_${todayStr}`;
+  const alreadyRan = await env.CACHE.get(dedupKey);
+  if (alreadyRan) {
+    return { generated: false, skippedReason: 'Already generated today' };
+  }
+
+  // Pick topic via rotation index
+  const idxStr = await env.CACHE.get('auto_blog_topic_idx') || '0';
+  let topicIdx = parseInt(idxStr, 10) % BLOG_TOPICS.length;
+  const topic = BLOG_TOPICS[topicIdx];
+
+  // Advance rotation for next run
+  await env.CACHE.put('auto_blog_topic_idx', String((topicIdx + 1) % BLOG_TOPICS.length), { expirationTtl: 86400 * 365 });
+
+  try {
+    // Step 1: Query Engine Runtime for domain expertise
+    const enginePrompt = `You are an expert technical blog writer. Write a comprehensive, SEO-optimized blog article about: "${topic.promptTheme}".
+
+Requirements:
+- Title should be compelling and include primary keywords (return it on the FIRST line prefixed with "TITLE: ")
+- Write 800-1200 words of substantive, expert-level content
+- Use markdown formatting with ## headings, bullet points, and bold text
+- Include real-world examples and practical advice
+- Include specific numbers, statistics, or technical details where relevant
+- End with a brief "Key Takeaways" section
+- Write in a professional but accessible tone
+- Do NOT mention any specific company names or products
+- Do NOT include any disclaimers or AI-generated notices
+- Write as a human domain expert would`;
+
+    const engineBody = JSON.stringify({
+      query: enginePrompt,
+      domain: topic.domain,
+      model: 'sonnet'
+    });
+
+    const engineResp = env.SVC_ENGINE
+      ? await env.SVC_ENGINE.fetch('https://internal/query/reason', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: engineBody
+        })
+      : await fetchWithTimeout(`${ENGINE_URL}/query/reason`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: engineBody
+        }, 60000);
+
+    if (!engineResp.ok) {
+      return { generated: false, error: `Engine Runtime ${engineResp.status}` };
+    }
+
+    const engineData = await engineResp.json() as any;
+    const rawContent = engineData.answer || engineData.response || '';
+
+    if (!rawContent || rawContent.length < 200) {
+      return { generated: false, error: 'Engine returned insufficient content' };
+    }
+
+    // Step 2: Parse title and content
+    const lines = rawContent.split('\n');
+    let title = '';
+    let contentStart = 0;
+
+    for (let i = 0; i < Math.min(lines.length, 5); i++) {
+      const line = lines[i].trim();
+      if (line.startsWith('TITLE:')) {
+        title = line.replace(/^TITLE:\s*/, '').replace(/^["#]+\s*/, '').replace(/["]+$/, '').trim();
+        contentStart = i + 1;
+        break;
+      }
+      if (line.startsWith('# ')) {
+        title = line.replace(/^#+\s*/, '').trim();
+        contentStart = i + 1;
+        break;
+      }
+    }
+
+    if (!title) {
+      // Fallback: generate title from theme
+      title = topic.promptTheme
+        .split(' ')
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+        .join(' ');
+    }
+
+    // Clean title: remove quotes, markdown artifacts
+    title = title.replace(/[*_`"]/g, '').trim();
+    if (title.length > 80) title = title.substring(0, 77) + '...';
+
+    // Generate slug from title
+    const slug = title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .substring(0, 60)
+      + `-${todayStr.replace(/-/g, '')}`;
+
+    // Extract content body (skip title line)
+    const contentBody = lines.slice(contentStart).join('\n').trim();
+
+    // Generate excerpt from first paragraph
+    const firstParagraph = contentBody.split('\n\n')[0] || contentBody.substring(0, 200);
+    const excerpt = firstParagraph
+      .replace(/[#*_`\[\]]/g, '')
+      .trim()
+      .substring(0, 160);
+
+    // Estimate read time
+    const wordCount = contentBody.split(/\s+/).length;
+    const readTime = `${Math.max(3, Math.ceil(wordCount / 200))} min`;
+
+    // Step 3: Check if slug already exists in blog-data.ts
+    const ghHeaders: Record<string, string> = {
+      'Accept': 'application/vnd.github.v3+json',
+      'User-Agent': 'EchoAutoBuilder/1.0',
+      'Authorization': `Bearer ${env.GITHUB_TOKEN}`
+    };
+
+    const blogFileResp = await safeFetchWithHeaders(
+      `${GITHUB_API}/repos/${GITHUB_OWNER}/${EPT_REPO}/contents/app/blog/blog-data.ts`,
+      ghHeaders,
+      30000
+    );
+
+    if (!blogFileResp.ok) {
+      return { generated: false, error: `Failed to fetch blog-data.ts: ${blogFileResp.status}` };
+    }
+
+    // Decode existing file
+    let existingContent = '';
+    try {
+      existingContent = decodeURIComponent(escape(atob(blogFileResp.data.content.replace(/\n/g, ''))));
+    } catch {
+      // Fallback: simple atob
+      existingContent = atob(blogFileResp.data.content.replace(/\n/g, ''));
+    }
+
+    // Check for duplicate slug
+    if (existingContent.includes(`slug: '${slug}'`)) {
+      return { generated: false, skippedReason: `Slug "${slug}" already exists` };
+    }
+
+    // Step 4: Build the new BlogPost entry
+    // Escape single quotes and backticks in content for TypeScript template literal safety
+    const escapedContent = contentBody
+      .replace(/\\/g, '\\\\')
+      .replace(/`/g, '\\`')
+      .replace(/\$/g, '\\$');
+
+    const escapedTitle = title.replace(/'/g, "\\'");
+    const escapedExcerpt = excerpt.replace(/'/g, "\\'");
+
+    const newEntry = `  {
+    slug: '${slug}',
+    title: '${escapedTitle}',
+    excerpt: '${escapedExcerpt}',
+    category: '${topic.category}',
+    date: '${todayStr}',
+    readTime: '${readTime}',
+    author: 'Echo Prime',
+    tags: [${topic.tags.map(t => `'${t}'`).join(', ')}],
+    content: \`${escapedContent}\`,
+  },`;
+
+    // Step 5: Insert new entry before the closing `];` of BLOG_POSTS
+    // Find the last `];` that closes the array (after the last blog entry)
+    const closingIdx = existingContent.lastIndexOf('];\n\nexport function formatDate');
+    if (closingIdx === -1) {
+      // Fallback: find the simple `];` pattern
+      const altIdx = existingContent.lastIndexOf('\n];\n');
+      if (altIdx === -1) {
+        return { generated: false, error: 'Could not find BLOG_POSTS array closing bracket' };
+      }
+      // Insert before the `];`
+      const updatedContent = existingContent.substring(0, altIdx) + '\n' + newEntry + '\n' + existingContent.substring(altIdx);
+      const pushResult = await pushToGitHub(
+        env, EPT_REPO, 'app/blog/blog-data.ts', updatedContent,
+        `feat(auto-blog): add "${title}" — auto-generated by Builder`,
+        blogFileResp.data.sha
+      );
+      if (!pushResult.success) {
+        return { generated: false, error: pushResult.error };
+      }
+    } else {
+      // Insert before `];\n\nexport function formatDate`
+      const updatedContent = existingContent.substring(0, closingIdx) + newEntry + '\n' + existingContent.substring(closingIdx);
+      const pushResult = await pushToGitHub(
+        env, EPT_REPO, 'app/blog/blog-data.ts', updatedContent,
+        `feat(auto-blog): add "${title}" — auto-generated by Builder`,
+        blogFileResp.data.sha
+      );
+      if (!pushResult.success) {
+        return { generated: false, error: pushResult.error };
+      }
+    }
+
+    // Step 6: Mark as done for today + log
+    await env.CACHE.put(dedupKey, JSON.stringify({ slug, title }), { expirationTtl: 86400 });
+    await incrementStat(env.DB, 'blogs_generated');
+    await incrementStat(env.DB, 'deploys');
+
+    await logAction(env.DB, {
+      action_type: 'auto_blog_generated',
+      target: slug,
+      details: JSON.stringify({ title, category: topic.category, domain: topic.domain, wordCount, readTime }),
+      result: 'success',
+      duration_ms: 0,
+      cycle_id: cid
+    });
+
+    return { generated: true, slug, title };
+
+  } catch (e: any) {
+    await logAction(env.DB, {
+      action_type: 'auto_blog_error',
+      target: 'auto-blog',
+      details: e.message,
+      result: 'error',
+      duration_ms: 0,
+      cycle_id: cid
+    });
+    return { generated: false, error: e.message };
+  }
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -5286,11 +5564,22 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       ctx.waitUntil(postToMoltBook(env, summary, 'building', ['audit', 'auto-builder']));
     }
 
-    // ═══ DAILY 8 AM UTC: Briefing + Changelog + Pruning ═══
+    // ═══ DAILY 8 AM UTC: Briefing + Changelog + Pruning + Auto-Blog ═══
     if (hour === 8 && minute === 0) {
       const changelog = await generateFleetChangelog(env, cid);
       await generateDailyBriefing(env, cid);
       ctx.waitUntil(pruneStaleData(env, cid));
+
+      // Auto-Blog Writer: generate one SEO article per day
+      const blogResult = await generateAutoBlog(env, cid);
+      if (blogResult.generated) {
+        ctx.waitUntil(reportToBrain(env,
+          `AUTO-BLOG: Published "${blogResult.title}" (${blogResult.slug}) to echo-ept.com/blog`,
+          7, ['auto-blog', 'content', 'seo']));
+        ctx.waitUntil(postToMoltBook(env,
+          `CC12: Auto-Blog published: "${blogResult.title}" — daily SEO content pipeline active`,
+          'building', ['auto-blog', 'content']));
+      }
 
       // Report changelog to Brain if there are changes
       if (changelog.entries.length > 0) {

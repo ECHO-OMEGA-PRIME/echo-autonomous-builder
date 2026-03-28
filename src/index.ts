@@ -288,6 +288,7 @@ const FALSE_POSITIVE_PATTERNS = [
   { match: 'mixed content', reason: 'false_mixed_content', resolution: 'auto-resolved: all assets served via Cloudflare HTTPS edge, mixed content not possible' },
   { match: 'Thin content', reason: 'csr_thin_content', resolution: 'auto-resolved: React/Next.js CSR page — JS bundle is large but stripped HTML is minimal (content renders client-side)' },
   { match: 'thin content', reason: 'csr_thin_content_lc', resolution: 'auto-resolved: React/Next.js CSR page — content renders client-side, not in SSR HTML' },
+  { match: 'placeholder data detected: "placeholder" (1 occurrences)', reason: 'html_placeholder_attr', resolution: 'auto-resolved: single "placeholder" occurrence is HTML input placeholder= attribute, not mock data' },
 ];
 
 // EPT website domains for link validation
@@ -892,6 +893,22 @@ async function processQABugs(env: Env, cid: string): Promise<{ processed: number
 
       // === QUEUE FIX: Mock/placeholder data ===
       if (bugTitle.includes('Mock') || bugTitle.includes('placeholder') || bugTitle.includes('lorem') || bugTitle.includes('Lorem') || bugTitle.includes('TODO') || bugTitle.includes('sample data')) {
+        // Auto-resolve if "placeholder" appears only 1 time — it's an HTML input placeholder= attribute
+        const lowOccurrenceMatch = bugTitle.match(/\((\d+) occurrences?\)/);
+        const occurrences = lowOccurrenceMatch ? parseInt(lowOccurrenceMatch[1]) : 999;
+        if (occurrences <= 2 && bugTitle.includes('"placeholder"')) {
+          autoResolved++;
+          await markQABugResolved(env, bug.id, 'auto-resolved: "placeholder" in low count is HTML form input placeholder= attribute, not mock data');
+          await logAction(env.DB, {
+            action_type: 'qa_auto_resolve',
+            target: bug.page,
+            details: JSON.stringify({ bugId: bug.id, reason: 'html_placeholder_attribute', occurrences }),
+            result: 'resolved',
+            duration_ms: 0,
+            cycle_id: cid
+          });
+          continue;
+        }
         queued++;
         await queueFix(env, {
           source: 'qa',

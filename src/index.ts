@@ -3326,12 +3326,13 @@ async function bridgeDiagnosticsFindings(env: Env, cid: string): Promise<{ check
             const fileData = await fileResp.json() as any;
             const content = decodeURIComponent(escape(atob(fileData.content.replace(/\n/g, ''))));
 
-            // Check if there's a proper outer try-catch in the fetch handler
+            // Check if there's a proper outer try-catch OR Hono global error handler
             const hasFetchHandler = /async\s+fetch\s*\(/.test(content) || /export\s+default\s*\{/.test(content);
             const tryCount = (content.match(/\btry\s*\{/g) || []).length;
-            const catchCount = (content.match(/\bcatch\s*\(/g) || []).length;
-            const hasJsonErrorReturn = /catch.*\{[\s\S]*?Response.*error/i.test(content) || /catch.*\{[\s\S]*?json\s*\(.*error/i.test(content);
-            const hasOuterHandler = tryCount >= 1 && catchCount >= 1 && hasFetchHandler;
+            const catchCount = (content.match(/\bcatch\s*[\(\{]/g) || []).length;
+            const hasHonoOnError = /app\.onError\s*\(/.test(content);
+            const hasHonoErrorHandler = /\.onError/.test(content) || /errorHandler/.test(content);
+            const hasOuterHandler = (tryCount >= 1 && catchCount >= 1 && hasFetchHandler) || hasHonoOnError || hasHonoErrorHandler;
 
             if (hasOuterHandler) {
               // Outer try-catch exists — D1 queries ARE protected at the request level
@@ -3348,7 +3349,7 @@ async function bridgeDiagnosticsFindings(env: Env, cid: string): Promise<{ check
               await logAction(env.DB, {
                 action_type: 'diagnostics_bridge_resolve',
                 target: repo,
-                details: `Resolved finding #${findingId} (${checkType}): outer try-catch present (${tryCount} try, ${catchCount} catch blocks). D1 queries are protected at request level.`,
+                details: `Resolved finding #${findingId} (${checkType}): error handling present (${tryCount} try, ${catchCount} catch, honoOnError=${hasHonoOnError}). D1 queries are protected.`,
                 result: 'auto_resolved',
                 duration_ms: 0,
                 cycle_id: cid

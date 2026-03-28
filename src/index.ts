@@ -209,7 +209,9 @@ const CRITICAL_WORKERS = [
   'echo-email-sender', 'echo-report-generator',
   // High-traffic products
   'echo-forms', 'echo-project-manager', 'echo-hr',
-  'echo-calendar', 'echo-workflow-automation', 'echo-finance-ai'
+  'echo-calendar', 'echo-workflow-automation', 'echo-finance-ai',
+  // Cold-start repeat offenders — need frequent warming
+  'echo-document-manager'
 ];
 
 // Deduplicated via Set — prevents double-warming the same worker

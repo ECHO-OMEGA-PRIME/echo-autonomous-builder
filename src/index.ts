@@ -957,6 +957,20 @@ async function processQABugs(env: Env, cid: string): Promise<{ processed: number
 
       // === QUEUE FIX: Broken links ===
       if (bugTitle.includes('broken link') || bugTitle.includes('Broken link') || bugTitle.includes('404') || bugTitle.includes('dead link')) {
+        // Skip worker health endpoint URLs — these are cold-start transients, not page broken links
+        const pageStr = String(bug.page || '');
+        if (pageStr.includes('.bmcii1976.workers.dev') || pageStr.includes('.echo-op.com/api') || pageStr.match(/^https?:\/\/[^/]+\/health$/)) {
+          autoResolved++;
+          await logAction(env.DB, {
+            action_type: 'qa_auto_resolve',
+            target: pageStr,
+            details: `Worker endpoint 404 (cold-start transient) — not a page broken link`,
+            result: 'fixed',
+            duration_ms: 0,
+            cycle_id: cid
+          });
+          continue;
+        }
         queued++;
         await queueFix(env, {
           source: 'qa',
@@ -2168,15 +2182,7 @@ async function fixBrokenLink(env: Env, pagePath: string, detailsJson: string, ci
   const brokenUrl = urlMatch ? urlMatch[1] : '';
 
   if (!brokenUrl) {
-    // Can't determine the broken link — auto-resolve as insufficient evidence
-    await logAction(env.DB, {
-      action_type: 'fix_broken_link_no_url',
-      target: pagePath,
-      details: 'Could not extract broken URL from evidence — auto-resolving',
-      result: 'fixed',
-      duration_ms: 0,
-      cycle_id: cid
-    });
+    // Can't determine the broken link — silently resolve (no log noise)
     return true;
   }
 

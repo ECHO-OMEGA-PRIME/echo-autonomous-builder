@@ -1,5 +1,5 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.17.0 — "SLA Compliance Monitor"
+ * ECHO AUTONOMOUS BUILDER v3.18.0 — "SLA Dashboard + Detailed View"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
@@ -6103,7 +6103,7 @@ h1{color:#ff6b35;font-size:1.8rem;margin-bottom:4px}
   <div class="card" id="infra-card"><h2>Infrastructure</h2><div id="infra">Loading...</div></div>
   <div class="card" id="cron-card"><h2>Cron Health</h2><div id="crons">Loading...</div></div>
   <div class="card" id="pctile-card"><h2>Latency Percentiles</h2><div id="pctiles">Loading...</div></div>
-  <div class="card" id="sla-card"><h2>SLA Compliance</h2><div id="sla">Loading...</div></div>
+  <div class="card" id="sla-card"><h2>SLA Compliance <a href="/dashboard/sla" style="color:#9932cc;font-size:0.8rem;font-weight:normal">[detailed →]</a></h2><div id="sla">Loading...</div></div>
   <div class="card" id="latency-card"><h2>Top Latency</h2><div id="latency">Loading...</div></div>
   <div class="card" id="engine-card"><h2>Engine Runtime</h2><div id="engines">Loading...</div></div>
 </div>
@@ -6212,6 +6212,111 @@ load();
 setInterval(()=>{countdown--;document.getElementById('timer').textContent='Refreshing in '+countdown+'s';if(countdown<=0){countdown=60;load();}},1000);
 </script></body></html>`;
     return new Response(html, { headers: { 'Content-Type': 'text/html; charset=utf-8', ...Object.fromEntries(Object.entries(corsHeaders).filter(([k]) => k !== 'Content-Type')) } });
+  }
+
+  // ─── /dashboard/sla — Dedicated SLA compliance dashboard ───
+  if (path === '/dashboard/sla') {
+    const slaHtml = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ECHO Fleet — SLA Compliance Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}body{background:#0a0a0a;color:#e0e0e0;font-family:system-ui,-apple-system,sans-serif;padding:20px}
+h1{color:#ff6b35;font-size:1.5rem;margin-bottom:4px}h2{color:#9932cc;font-size:1.1rem;margin-bottom:10px}
+.hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:15px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:12px}
+.card{background:#111;border:1px solid #222;border-radius:8px;padding:14px}
+.kpi{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid #1a1a1a}
+.kpi:last-child{border:none}.kpi-label{color:#888}.kpi-val{font-weight:600;font-variant-numeric:tabular-nums}
+.good{color:#22c55e}.warn{color:#f59e0b}.bad{color:#ef4444}
+table{width:100%;border-collapse:collapse;font-size:0.85rem;margin-top:8px}
+th{text-align:left;color:#888;padding:6px 8px;border-bottom:1px solid #333}
+td{padding:5px 8px;border-bottom:1px solid #1a1a1a}
+.badge{display:inline-block;padding:1px 6px;border-radius:4px;font-size:0.75rem;font-weight:600}
+.badge-pass{background:#052e16;color:#22c55e}.badge-fail{background:#450a0a;color:#ef4444}
+.badge-warn{background:#451a03;color:#f59e0b}
+.back{color:#9932cc;text-decoration:none;font-size:0.9rem}
+#error{display:none;background:#450a0a;color:#ef4444;padding:10px;border-radius:6px;margin-bottom:12px}
+#timer{color:#555;font-size:0.8rem}
+</style></head><body>
+<div class="hdr">
+  <div><h1>SLA Compliance Dashboard</h1><a class="back" href="/dashboard">← Main Dashboard</a></div>
+  <div id="timer">Loading...</div>
+</div>
+<div id="error"></div>
+<div class="grid" id="main">
+  <div class="card"><h2>Fleet SLA Summary</h2><div id="summary">Loading...</div></div>
+  <div class="card"><h2>SLA Thresholds</h2><div id="thresholds">Loading...</div></div>
+</div>
+<div class="card" style="margin-top:12px"><h2>Worker Violations</h2><div id="violations">Loading...</div></div>
+<div class="card" style="margin-top:12px"><h2>7-Day History</h2><div id="history">Loading...</div></div>
+<script>
+const BASE=location.origin;
+let countdown=60;
+function m(l,v,c){return '<div class="kpi"><span class="kpi-label">'+l+'</span><span class="kpi-val '+(c||'')+'">'+v+'</span></div>';}
+async function load(){
+  try{
+    const r=await fetch(BASE+'/sla');
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    const d=await r.json();
+    const c=d.current||{};
+    const th=d.slaThresholds||{};
+    document.getElementById('error').style.display='none';
+    // Summary
+    const pct=c.checked>0?Math.round((c.compliant/c.checked)*100):100;
+    document.getElementById('summary').innerHTML=
+      m('Compliance Rate',pct+'%',pct>=95?'good':pct>=80?'warn':'bad')+
+      m('Compliant Workers',c.compliant+'/'+c.checked,c.compliant===c.checked?'good':'warn')+
+      m('Total Violations',c.violations?.length||0,c.violations?.length===0?'good':'bad')+
+      m('Fleet Availability',c.fleetAvailability+'%',c.fleetAvailability>=99.5?'good':'warn')+
+      m('Fleet p50',c.fleetP50+'ms',c.fleetP50<th.p50?'good':'bad')+
+      m('Fleet p90',c.fleetP90+'ms',c.fleetP90<th.p90?'good':'bad')+
+      m('Fleet p95',c.fleetP95+'ms',c.fleetP95<th.p95?'good':'bad');
+    // Thresholds
+    document.getElementById('thresholds').innerHTML=
+      m('p50 Threshold','< '+th.p50+'ms')+
+      m('p90 Threshold','< '+th.p90+'ms')+
+      m('p95 Threshold','< '+th.p95+'ms')+
+      m('p99 Threshold','< '+th.p99+'ms')+
+      m('Availability','≥ '+th.availabilityPct+'%');
+    // Violations table
+    const viols=c.violations||[];
+    if(viols.length>0){
+      const grouped={};
+      viols.forEach(v=>{if(!grouped[v.worker])grouped[v.worker]=[];grouped[v.worker].push(v);});
+      let h='<table><tr><th>Worker</th><th>Violations</th><th>Details</th></tr>';
+      Object.entries(grouped).sort((a,b)=>b[1].length-a[1].length).forEach(([w,vs])=>{
+        const badges=vs.map(v=>{
+          const cls=v.metric==='availability'?'fail':v.value>v.threshold*2?'fail':'warn';
+          return '<span class="badge badge-'+cls+'">'+v.metric+'='+v.value+(v.metric==='availability'?'%':'ms')+'</span>';
+        }).join(' ');
+        h+='<tr><td style="color:#ccc">'+w.replace('echo-','')+'</td><td>'+vs.length+'</td><td>'+badges+'</td></tr>';
+      });
+      h+='</table>';
+      document.getElementById('violations').innerHTML=h;
+    }else{document.getElementById('violations').innerHTML='<span class="good">✓ All workers compliant</span>';}
+    // History
+    const hist=d.history||[];
+    if(hist.length>0){
+      let h='<table><tr><th>Date</th><th>Compliant</th><th>Violations</th><th>Avail %</th><th>p50</th><th>p90</th></tr>';
+      hist.forEach(s=>{
+        const pct2=s.checked>0?Math.round((s.compliant/s.checked)*100):100;
+        h+='<tr><td>'+s.date+'</td><td><span class="'+(pct2>=95?'good':pct2>=80?'warn':'bad')+'">'+s.compliant+'/'+s.checked+' ('+pct2+'%)</span></td>';
+        h+='<td>'+(s.violationCount||0)+'</td><td><span class="'+(s.fleetAvailability>=99.5?'good':'warn')+'">'+s.fleetAvailability+'%</span></td>';
+        h+='<td><span class="'+(s.fleetP50<300?'good':'bad')+'">'+s.fleetP50+'ms</span></td>';
+        h+='<td><span class="'+(s.fleetP90<1000?'good':'bad')+'">'+s.fleetP90+'ms</span></td></tr>';
+      });
+      h+='</table>';
+      document.getElementById('history').innerHTML=h;
+    }else{document.getElementById('history').innerHTML='<span style="color:#555">No history yet — snapshots saved every 4 hours</span>';}
+  }catch(e){
+    document.getElementById('error').textContent='Error: '+e.message;
+    document.getElementById('error').style.display='block';
+  }
+}
+load();
+setInterval(()=>{countdown--;document.getElementById('timer').textContent='Refreshing in '+countdown+'s';if(countdown<=0){countdown=120;load();}},1000);
+</script></body></html>`;
+    return new Response(slaHtml, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
   }
 
   // ─── 404 ───

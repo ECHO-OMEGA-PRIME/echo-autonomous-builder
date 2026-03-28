@@ -3268,13 +3268,11 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
   const minute = new Date(event.scheduledTime).getMinutes();
   const hour = new Date(event.scheduledTime).getHours();
 
-  // Rate limit: don't run if we ran less than 2 minutes ago
-  const lastRun = await env.CACHE.get('last_cron_run');
-  const now = Date.now();
-  if (lastRun && now - parseInt(lastRun) < 120000) {
-    return; // Skip — ran too recently
-  }
-  await env.CACHE.put('last_cron_run', String(now), { expirationTtl: 300 });
+  // Dedup: use scheduledTime rounded to minute (prevents race conditions from concurrent cron invocations)
+  const dedupKey = `cron_${Math.floor(event.scheduledTime / 60000)}`;
+  const alreadyRan = await env.CACHE.get(dedupKey);
+  if (alreadyRan) return;
+  await env.CACHE.put(dedupKey, '1', { expirationTtl: 300 });
 
   try {
     // ═══ EVERY 5 MINUTES: Warm up critical workers ═══

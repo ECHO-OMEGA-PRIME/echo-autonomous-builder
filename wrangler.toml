@@ -8,7 +8,7 @@ binding = "ANALYTICS"
 dataset = "echo_metrics"
 
 [triggers]
-crons = ["*/5 * * * *", "*/30 * * * *", "0 */4 * * *", "0 8 * * *"]
+crons = ["*/5 * * * *"]
 
 [[d1_databases]]
 binding = "DB"

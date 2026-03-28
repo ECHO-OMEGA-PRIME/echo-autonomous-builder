@@ -4565,6 +4565,171 @@ async function detectVersionDrift(env: Env, cid: string): Promise<{ driftScore: 
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 26: CRON HEALTH MONITOR
+// Detects when cron-based Workers stop executing
+// ═══════════════════════════════════════════════════
+
+interface CronTarget {
+  name: string;
+  binding?: string;           // Service binding name (preferred)
+  url?: string;               // Direct HTTP URL (fallback)
+  expectedIntervalMin: number; // How often the cron should fire
+  statusEndpoint: string;     // Endpoint to check for freshness
+  timestampPath: string;      // Dot-notation JSON path to last-run timestamp
+  graceFactor: number;        // Alert if age > expectedInterval * graceFactor
+  // Optional: if provided, check this path for pending queue items.
+  // If all items are complete (0 pending), skip staleness check — worker is idle, not stale.
+  queuePendingPath?: string;  // Dot-notation to pending count (0 = idle)
+}
+
+const CRON_TARGETS: CronTarget[] = [
+  {
+    name: 'echo-doctrine-forge',
+    binding: 'SVC_DOCTRINE',
+    expectedIntervalMin: 2,
+    statusEndpoint: '/stats',
+    timestampPath: 'recent_runs.0.started_at',
+    graceFactor: 30, // Runs can take 10+ min; alert if >60 min since last start
+    queuePendingPath: '_pending_count', // Computed from queue array
+  },
+  {
+    name: 'echo-autonomous-daemon',
+    binding: 'SVC_DAEMON',
+    expectedIntervalMin: 10,
+    statusEndpoint: '/health',
+    timestampPath: 'lastCycle',
+    graceFactor: 3, // Alert if >30 min since last cycle
+  },
+  {
+    name: 'echo-qa-tester',
+    binding: 'SVC_QA',
+    expectedIntervalMin: 720,   // Runs roughly every 12 hours
+    statusEndpoint: '/health',
+    timestampPath: 'timestamp',
+    graceFactor: 2,
+  },
+  {
+    name: 'echo-bot-auditor',
+    binding: 'SVC_BOTAUDITOR',
+    expectedIntervalMin: 360,   // Every 6 hours
+    statusEndpoint: '/health',
+    timestampPath: 'timestamp',
+    graceFactor: 2,
+  },
+  {
+    name: 'echo-knowledge-scout',
+    binding: 'SVC_KNOWLEDGESCOUT',
+    expectedIntervalMin: 240,   // Every 4 hours
+    statusEndpoint: '/health',
+    timestampPath: 'timestamp',
+    graceFactor: 3,
+  },
+  {
+    name: 'echo-cron-orchestrator',
+    binding: 'SVC_CRONORCH',
+    expectedIntervalMin: 60,
+    statusEndpoint: '/health',
+    timestampPath: 'timestamp',
+    graceFactor: 3,
+  },
+];
+
+function extractNestedTimestamp(obj: any, path: string): string | null {
+  const parts = path.split('.');
+  let current = obj;
+  for (const part of parts) {
+    if (current == null) return null;
+    if (/^\d+$/.test(part)) {
+      current = Array.isArray(current) ? current[parseInt(part)] : current[part];
+    } else {
+      current = current[part];
+    }
+  }
+  return typeof current === 'string' ? current : null;
+}
+
+async function monitorCronHealth(env: Env, cid: string): Promise<{ checked: number; healthy: number; stale: string[]; errors: string[] }> {
+  const results = { checked: 0, healthy: 0, stale: [] as string[], errors: [] as string[] };
+
+  for (const target of CRON_TARGETS) {
+    try {
+      let response: Response;
+      if (target.binding && (env as any)[target.binding]) {
+        response = await (env as any)[target.binding].fetch(new Request(`https://internal${target.statusEndpoint}`));
+      } else if (target.url) {
+        response = await fetch(`${target.url}${target.statusEndpoint}`, { signal: AbortSignal.timeout(10000) });
+      } else {
+        continue;
+      }
+
+      results.checked++;
+
+      if (!response.ok) {
+        results.errors.push(`${target.name}: HTTP ${response.status}`);
+        continue;
+      }
+
+      const data = await response.json() as any;
+
+      // Queue-awareness: if worker has a queue and all items are complete, it's idle not stale
+      if (target.queuePendingPath && data.queue) {
+        const pendingItems = Array.isArray(data.queue)
+          ? data.queue.filter((q: any) => q.status !== 'complete').reduce((s: number, q: any) => s + (q.cnt || 0), 0)
+          : 0;
+        if (pendingItems === 0) {
+          results.healthy++; // Queue empty — worker is idle, cron still fires but no work
+          continue;
+        }
+      }
+
+      const tsStr = extractNestedTimestamp(data, target.timestampPath);
+
+      if (!tsStr) {
+        results.healthy++; // Responding but no timestamp — assume healthy
+        continue;
+      }
+
+      // Parse timestamp: handle ISO "2026-03-28T19:07:32.019Z" and DB "2026-03-28 08:49:39"
+      const normalized = tsStr.includes('T') ? tsStr : tsStr.replace(' ', 'T') + 'Z';
+      const ts = new Date(normalized);
+      if (isNaN(ts.getTime())) {
+        results.healthy++;
+        continue;
+      }
+
+      const ageMinutes = (Date.now() - ts.getTime()) / 60000;
+      const threshold = target.expectedIntervalMin * target.graceFactor;
+
+      if (ageMinutes > threshold) {
+        const msg = `${target.name}: last run ${Math.round(ageMinutes)}min ago (expected every ${target.expectedIntervalMin}min, threshold ${threshold}min)`;
+        results.stale.push(msg);
+
+        await logAction(env.DB, {
+          action_type: 'cron_stale',
+          target: target.name,
+          details: `Cron stale. Last run: ${tsStr} (${Math.round(ageMinutes)}min ago). Expected interval: ${target.expectedIntervalMin}min. Threshold: ${threshold}min.`,
+          result: 'alert',
+          duration_ms: 0,
+          cycle_id: cid
+        });
+      } else {
+        results.healthy++;
+      }
+    } catch (e: any) {
+      results.checked++;
+      results.errors.push(`${target.name}: ${e.message}`);
+    }
+  }
+
+  // Report stale crons to Brain
+  if (results.stale.length > 0) {
+    await reportToBrain(env, `CRON HEALTH ALERT: ${results.stale.length} stale crons:\n${results.stale.join('\n')}`, 8, ['cron-health', 'alert']).catch(() => {});
+  }
+
+  return results;
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -4598,15 +4763,16 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       ctx.waitUntil(adaptiveColdStartWarmup(env, cid));
     }
 
-    // ═══ EVERY 30 MINUTES: Process QA bugs + daemon tasks + execute fixes ═══
+    // ═══ EVERY 30 MINUTES: Process QA bugs + daemon tasks + execute fixes + cron health ═══
     if (minute % 30 === 0) {
       const qaResult = await processQABugs(env, cid);
       const daemonResult = await processDaemonTasks(env, cid);
       const fixResult = await executeFixQueue(env, cid, 15);
       const evoFixResult = await executeEvolutionFixes(env, cid);
       const verifyResult = await verifyEndpoints(env, cid);
+      const cronHealth = await monitorCronHealth(env, cid);
 
-      const summary = `Cycle ${cid}: QA processed=${qaResult.processed} autoResolved=${qaResult.autoResolved} queued=${qaResult.queued} | Daemon processed=${daemonResult.processed} resolved=${daemonResult.resolved} | Fixes attempted=${fixResult.attempted} fixed=${fixResult.fixed} failed=${fixResult.failed} | EvoFixes fixed=${evoFixResult.fixed}/${evoFixResult.attempted} failed=${evoFixResult.failed} | Verify: ${verifyResult.verified} checked, ${verifyResult.issues.length} issues`;
+      const summary = `Cycle ${cid}: QA processed=${qaResult.processed} autoResolved=${qaResult.autoResolved} queued=${qaResult.queued} | Daemon processed=${daemonResult.processed} resolved=${daemonResult.resolved} | Fixes attempted=${fixResult.attempted} fixed=${fixResult.fixed} failed=${fixResult.failed} | EvoFixes fixed=${evoFixResult.fixed}/${evoFixResult.attempted} failed=${evoFixResult.failed} | Verify: ${verifyResult.verified} checked, ${verifyResult.issues.length} issues | CronHealth: ${cronHealth.healthy}/${cronHealth.checked} healthy, ${cronHealth.stale.length} stale`;
 
       await logAction(env.DB, {
         action_type: 'cycle_30min',
@@ -4648,8 +4814,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const depAudit = await auditDependencies(env, cid);
       const trendReport = await analyzeFleetTrends(env, cid);
       const versionDrift = await detectVersionDrift(env, cid);
+      const cronHealth = await monitorCronHealth(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions)`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | CronHealth: ${cronHealth.healthy}/${cronHealth.checked} healthy, ${cronHealth.stale.length} stale`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -4875,6 +5042,28 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         coldStarts: r.unhealthy_checks || 0
       })),
       recentAnalysis: recentAnalysis.results
+    }), { headers: corsHeaders });
+  }
+
+  // ─── /cron-health ───
+  if (path === '/cron-health') {
+    const cid = cycleId();
+    const cronHealth = await monitorCronHealth(env, cid);
+
+    // Also pull recent stale alerts from actions_log
+    const recentAlerts = await env.DB.prepare(
+      `SELECT target, details, created_at FROM actions_log WHERE action_type = 'cron_stale' ORDER BY created_at DESC LIMIT 20`
+    ).all();
+
+    return new Response(JSON.stringify({
+      service: 'echo-autonomous-builder',
+      module: 'cron-health-monitor',
+      checked: cronHealth.checked,
+      healthy: cronHealth.healthy,
+      stale: cronHealth.stale,
+      errors: cronHealth.errors,
+      targets: CRON_TARGETS.map(t => ({ name: t.name, expectedIntervalMin: t.expectedIntervalMin, graceFactor: t.graceFactor })),
+      recentAlerts: recentAlerts.results
     }), { headers: corsHeaders });
   }
 

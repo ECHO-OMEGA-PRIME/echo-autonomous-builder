@@ -20,7 +20,7 @@ binding = "CACHE"
 id = "1714cf3a143e46f0aca7e8bc6ea7d060"
 
 [vars]
-WORKER_VERSION = "3.8.0"
+WORKER_VERSION = "3.9.0"
 CLOUDFLARE_ACCOUNT_ID = "b9af3a4bf161132bb7e5d3d365fb8bb0"
 
 # Service bindings for worker-to-worker communication
@@ -362,3 +362,16 @@ service = "echo-project-management"
 [[services]]
 binding = "SVC_VENDORMGR"
 service = "echo-vendor-manager"
+
+# ═══ Cron Health Monitor bindings (2026-03-28 CC10) ═══
+[[services]]
+binding = "SVC_BOTAUDITOR"
+service = "echo-bot-auditor"
+
+[[services]]
+binding = "SVC_KNOWLEDGESCOUT"
+service = "echo-knowledge-scout"
+
+[[services]]
+binding = "SVC_CRONORCH"
+service = "echo-cron-orchestrator"

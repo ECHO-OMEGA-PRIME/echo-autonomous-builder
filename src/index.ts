@@ -6157,10 +6157,17 @@ async function auditWorkerSecurity(env: Env, cid: string): Promise<SecurityAudit
       }
 
       // CHECK 4: SQL injection via template literals in prepare()
+      // Exclude safe patterns: allowlisted field names joined into SET/WHERE, and .bind() follows
       for (let i = 0; i < lines.length; i++) {
         if (/\.prepare\s*\(\s*`[^`]*\$\{/.test(lines[i])) {
-          const ctx = lines.slice(Math.max(0, i - 5), Math.min(lines.length, i + 5)).join('\n');
-          if (!/allowedFields|ALLOWED_FIELDS|validFields|fieldAllowlist|sortFields|SORT_FIELDS/.test(ctx)) {
+          const ctx = lines.slice(Math.max(0, i - 15), Math.min(lines.length, i + 5)).join('\n');
+          // Safe pattern: field allowlist + join into SQL + .bind() with values
+          const hasAllowlist = /allowedFields|ALLOWED_FIELDS|validFields|fieldAllowlist|sortFields|SORT_FIELDS|\.includes\s*\(\s*k\s*\)/i.test(ctx);
+          // Safe pattern: dynamic SET clause from allowlisted fields with bind params
+          const isDynamicSetWithBind = /\$\{(?:fields|sets|f|updates|cols)\.join\s*\(/.test(lines[i]) && /\.bind\s*\(/.test(lines[i]);
+          // Safe pattern: table name constants or other safe interpolations
+          const isSafeConstant = /\$\{(?:TABLE|PREFIX|SCHEMA|tableName)\}/.test(lines[i]);
+          if (!hasAllowlist && !isDynamicSetWithBind && !isSafeConstant) {
             report.findings.push({ repo, issue: 'sql_injection', severity: 'critical',
               detail: `Template literal in D1 prepare() at line ${i + 1}`, line: i + 1 });
             repoFindings++;

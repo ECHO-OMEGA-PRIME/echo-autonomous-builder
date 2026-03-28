@@ -1,5 +1,5 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.12.0 — "Rolling Uptime + Noise Reduction"
+ * ECHO AUTONOMOUS BUILDER v3.13.0 — "Cron Alert Dedup Hardening"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
@@ -4802,11 +4802,10 @@ async function monitorCronHealth(env: Env, cid: string): Promise<{ checked: numb
         const msg = `${target.name}: last run ${Math.round(ageMinutes)}min ago (expected every ${target.expectedIntervalMin}min, threshold ${threshold}min)`;
         results.stale.push(msg);
 
-        // Dedup: only log alert if no cron_stale for this target in last 60 min
-        const recentAlert = await env.DB.prepare(
-          "SELECT id FROM actions_log WHERE action_type = 'cron_stale' AND target = ? AND created_at > datetime('now', '-60 minutes') LIMIT 1"
-        ).bind(target.name).first();
-        if (!recentAlert) {
+        // Dedup via KV (strongly consistent, prevents race across concurrent cron invocations)
+        const kvDedupKey = `cron_stale_dedup_${target.name}`;
+        const recentKV = await env.CACHE.get(kvDedupKey);
+        if (!recentKV) {
           await logAction(env.DB, {
             action_type: 'cron_stale',
             target: target.name,
@@ -4815,6 +4814,7 @@ async function monitorCronHealth(env: Env, cid: string): Promise<{ checked: numb
             duration_ms: 0,
             cycle_id: cid
           });
+          await env.CACHE.put(kvDedupKey, new Date().toISOString(), { expirationTtl: 3600 }); // 1hr dedup
         }
       } else {
         results.healthy++;
@@ -5062,10 +5062,11 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const depAudit = await auditDependencies(env, cid);
       const trendReport = await analyzeFleetTrends(env, cid);
       const versionDrift = await detectVersionDrift(env, cid);
-      const cronHealth = await monitorCronHealth(env, cid);
+      // NOTE: monitorCronHealth() already called in 30-min block (which also fires at hour boundaries)
+      // Reuse that result — don't double-call and risk duplicate stale alerts
       const infraAnomaly = await detectInfrastructureAnomaly(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | CronHealth: ${cronHealth.healthy}/${cronHealth.checked} healthy, ${cronHealth.stale.length} stale | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%)`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%)`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -5230,7 +5231,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'adaptive_cold_start_warmup',
         'fleet_changelog_generation', 'version_drift_detection',
         'infrastructure_anomaly_detection', 'on_demand_fleet_report',
-        'rolling_uptime_7day', 'profile_rebaseline'
+        'rolling_uptime_7day', 'profile_rebaseline', 'kv_cron_alert_dedup'
       ]
     }), { headers: corsHeaders });
   }
@@ -5435,9 +5436,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     const cid = cycleId();
     const cronHealth = await monitorCronHealth(env, cid);
 
-    // Also pull recent stale alerts from actions_log
+    // Only show stale alerts from last 6 hours (older ones are noise)
     const recentAlerts = await env.DB.prepare(
-      `SELECT target, details, created_at FROM actions_log WHERE action_type = 'cron_stale' ORDER BY created_at DESC LIMIT 20`
+      `SELECT target, details, created_at FROM actions_log WHERE action_type = 'cron_stale' AND created_at > datetime('now', '-6 hours') ORDER BY created_at DESC LIMIT 20`
     ).all();
 
     return new Response(JSON.stringify({

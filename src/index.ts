@@ -161,6 +161,7 @@ const SERVICE_BINDING_MAP: Record<string, string> = {
   'echo-appointments': 'SVC_APPOINTMENTS',
   'echo-hr-management': 'SVC_HRMANAGEMENT',
   'echo-project-management': 'SVC_PROJECTMANAGEMENT',
+  'echo-vendor-manager': 'SVC_VENDORMGR',
 };
 
 interface ActionLog {
@@ -227,7 +228,8 @@ const CRITICAL_WORKERS = [
   'echo-customer-success', 'echo-subscription', 'echo-data-room',
   'echo-ab-testing-engine', 'echo-coin-rewards', 'echo-documents',
   'echo-workflows', 'echo-invoicing', 'echo-appointments',
-  'echo-hr-management', 'echo-project-management'
+  'echo-hr-management', 'echo-project-management',
+  'echo-vendor-manager'
 ];
 
 // Deduplicated via Set — prevents double-warming the same worker
@@ -259,7 +261,8 @@ const ALL_MONITORED_WORKERS = [...new Set([
   'echo-customer-success', 'echo-subscription', 'echo-data-room',
   'echo-ab-testing-engine', 'echo-coin-rewards', 'echo-documents',
   'echo-workflows', 'echo-invoicing', 'echo-appointments',
-  'echo-hr-management', 'echo-project-management'
+  'echo-hr-management', 'echo-project-management',
+  'echo-vendor-manager'
 ])];
 
 const KNOWN_REDIRECT_PAGES = [

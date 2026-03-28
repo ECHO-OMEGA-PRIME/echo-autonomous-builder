@@ -354,3 +354,7 @@ service = "echo-hr-management"
 [[services]]
 binding = "SVC_PROJECTMANAGEMENT"
 service = "echo-project-management"
+
+[[services]]
+binding = "SVC_VENDORMGR"
+service = "echo-vendor-manager"

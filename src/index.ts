@@ -2819,29 +2819,31 @@ async function scanRepoForEvolution(env: Env, cid: string): Promise<{ scanned: n
         analysisFindings.push('HARDENING: Potential hardcoded secret detected');
       }
 
-      // Check for missing CORS headers
-      if (content.includes('new Response') && !content.includes('Access-Control-Allow-Origin')) {
-        analysisFindings.push('HARDENING: Missing CORS headers');
+      // Check for missing CORS headers (only on large public-facing workers)
+      if (lineCount > 500 && content.includes('new Response') && !content.includes('Access-Control-Allow-Origin')
+          && (content.includes('POST') || content.includes('OPTIONS'))) {
+        analysisFindings.push('HARDENING: Missing CORS headers on public-facing endpoints');
       }
 
-      // Check for missing error handling
-      if (content.includes('async function') && !content.includes('try')) {
+      // Check for missing error handling (comprehensive detection)
+      const hasErrorHandling = content.includes('try {') || content.includes('try{')
+        || content.includes('.catch(') || content.includes('app.onError')
+        || content.includes('catch (') || content.includes('catch(');
+      if (content.includes('async function') && !hasErrorHandling && lineCount > 100) {
         analysisFindings.push('HARDENING: Functions lack try/catch error handling');
       }
 
-      // Check for missing rate limiting
-      if (!content.includes('rate') && !content.includes('limit') && lineCount > 200) {
-        analysisFindings.push('HARDENING: No rate limiting detected');
+      // Check for missing rate limiting (only large workers with public writes)
+      if (lineCount > 500 && !content.includes('rate') && !content.includes('limit')
+          && !content.includes('CACHE') && content.match(/\.post\(|\.put\(|\.delete\(/i)) {
+        analysisFindings.push('HARDENING: No rate limiting on write endpoints');
       }
 
-      // Check for optimization opportunities
-      if (content.includes('.prepare(') && !content.includes('.batch(')) {
-        analysisFindings.push('OPTIMIZATION: D1 queries not batched — could use db.batch()');
-      }
-
-      // Check for old patterns
-      if (content.includes('console.log') && !content.includes('console.error')) {
-        analysisFindings.push('OPTIMIZATION: Using console.log instead of structured logging');
+      // Check for missing auth on write endpoints (only if has POST routes)
+      if (lineCount > 200 && content.match(/\.(post|put|delete)\s*\(/)
+          && !content.includes('API_KEY') && !content.includes('auth')
+          && !content.includes('Bearer') && !content.includes('X-Echo')) {
+        analysisFindings.push('HARDENING: Write endpoints without authentication');
       }
 
       // Check version
@@ -2852,12 +2854,18 @@ async function scanRepoForEvolution(env: Env, cid: string): Promise<{ scanned: n
       }
 
       // Feature gap analysis
-      if (!content.includes('service binding') && !content.includes('SVC_') && lineCount > 300) {
-        analysisFindings.push('FEATURE: Could benefit from service bindings for inter-worker calls');
+      if (!content.includes('SVC_') && !content.includes('env.') && lineCount > 500
+          && (content.includes('fetch(') && content.includes('workers.dev'))) {
+        analysisFindings.push('FEATURE: Uses public URLs for inter-worker calls — should use service bindings');
       }
 
-      if (!content.includes('cron') && !content.includes('scheduled') && lineCount > 500) {
+      if (!content.includes('cron') && !content.includes('scheduled') && lineCount > 800) {
         analysisFindings.push('FEATURE: Large worker without cron automation — could benefit from scheduled tasks');
+      }
+
+      // Check for SQL injection risk (string interpolation in queries)
+      if (content.match(/prepare\s*\(\s*`[^`]*\$\{/)) {
+        analysisFindings.push('HARDENING: SQL injection risk — template literals in D1 prepare()');
       }
 
       // Store findings
@@ -3311,8 +3319,23 @@ const CORS_HEADERS = {
         continue; // Skip push for version upgrades
       }
 
+      // ── HARDENING: SQL injection risk ──
+      if (finding.includes('SQL injection risk')) {
+        // Too dangerous to auto-fix — flag for CC review
+        await env.DB.prepare(`UPDATE evolution_scans SET status = 'detected', ai_recommendation = ? WHERE id = ?`)
+          .bind('CRITICAL: Template literal interpolation in D1 prepare() detected. Must use parameterized queries. Requires CC session review.', scanId).run();
+        continue;
+      }
+
+      // ── HARDENING: Write endpoints without authentication ──
+      if (finding.includes('Write endpoints without authentication')) {
+        await env.DB.prepare(`UPDATE evolution_scans SET status = 'detected', ai_recommendation = ? WHERE id = ?`)
+          .bind('Write endpoints exposed without auth middleware. Requires CC session to add X-Echo-API-Key validation.', scanId).run();
+        continue;
+      }
+
       // ── FEATURE: service bindings / cron ──
-      if (finding.includes('Could benefit from service bindings') || finding.includes('could benefit from scheduled tasks')) {
+      if (finding.includes('service bindings') || finding.includes('could benefit from scheduled tasks')) {
         // Feature suggestions — log but don't auto-fix
         await env.DB.prepare(`UPDATE evolution_scans SET status = 'detected', ai_recommendation = ? WHERE id = ?`)
           .bind(`Feature suggestion noted. ${finding}. This requires architectural changes — flagged for CC session review.`, scanId).run();

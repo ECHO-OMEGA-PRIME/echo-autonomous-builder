@@ -1,10 +1,10 @@
 /**
- * ECHO AUTONOMOUS BUILDER v3.25.0 — "Fleet Topology Mapper"
+ * ECHO AUTONOMOUS BUILDER v3.30.0 — "Resource Budget Monitor"
  * ====================================================
  * The EXECUTION ENGINE for ECHO OMEGA PRIME.
  * Everything else watches. This Worker DOES.
  *
- * 33 Modules:
+ * 39 Modules:
  * 1. Worker Warmer — keeps critical workers warm, eliminates cold-start latency alerts
  * 2. QA Bug Processor — auto-resolves false positives, queues real fixes
  * 3. Daemon Task Resolver — resolves pending performance tasks
@@ -38,6 +38,12 @@
  * 31. Revenue Pipeline Monitor — tracks product health, subscriptions, trials, MRR potential
  * 32. Doctrine Quality Auditor — scans for pre-GOLD doctrines, triggers Forge re-generation
  * 33. Fleet Topology Mapper — scans wrangler.toml files to build service binding dependency graph
+ * 34. Deploy Regression Detector — detects latency/health regressions after deploys
+ * 35. Security Auditor — scans worker code for hardcoded secrets, missing auth, CORS issues
+ * 36. API Endpoint Cataloger — discovers and catalogs all endpoints across fleet
+ * 37. Auto-Recovery Engine — automatically recovers workers from SLA violations
+ * 38. Cross-Worker Error Correlation — detects simultaneous multi-worker failures
+ * 39. Resource Budget Monitor — tracks Cloudflare free tier usage limits
  *
  * Cron Schedule:
  * - every 5 min: warm up critical workers + quick health pulse
@@ -568,6 +574,21 @@ async function initDB(db: D1Database): Promise<void> {
     created_at TEXT DEFAULT (datetime('now'))
   )`).run().catch(() => {});
   await db.prepare(`CREATE INDEX IF NOT EXISTS idx_error_corr_time ON error_correlations (created_at)`).run().catch(() => {});
+
+  // MODULE 39: Resource Budget Monitor (v3.30)
+  await db.prepare(`CREATE TABLE IF NOT EXISTS resource_budget (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle_id TEXT NOT NULL,
+    resource_type TEXT NOT NULL,
+    current_usage INTEGER DEFAULT 0,
+    daily_limit INTEGER DEFAULT 0,
+    monthly_limit INTEGER DEFAULT 0,
+    usage_pct REAL DEFAULT 0,
+    alert_level TEXT DEFAULT 'ok',
+    details TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`).run().catch(() => {});
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_resource_time ON resource_budget (created_at)`).run().catch(() => {});
 }
 
 // ═══════════════════════════════════════════════════
@@ -7250,6 +7271,172 @@ async function detectErrorCorrelations(env: Env, cid: string): Promise<Correlati
 }
 
 // ═══════════════════════════════════════════════════
+// MODULE 39: Cloudflare Resource Budget Monitor
+// Tracks D1/KV/R2/Worker request usage against free
+// tier limits. Alerts when approaching thresholds.
+// Free tier: 100K D1 reads/day, 1K D1 writes/day,
+// 100K KV reads/day, 1K KV writes/day, 100K req/day.
+// ═══════════════════════════════════════════════════
+
+interface ResourceBudgetResult {
+  resources: Array<{
+    type: string;
+    current: number;
+    dailyLimit: number;
+    usagePct: number;
+    alertLevel: string;
+    details: string;
+  }>;
+  alerts: string[];
+  overBudget: boolean;
+}
+
+// Cloudflare Free Tier Limits (daily)
+const CF_FREE_LIMITS = {
+  d1_reads: 5_000_000,    // 5M reads/day (free)
+  d1_writes: 100_000,     // 100K writes/day (free)
+  d1_rows_read: 5_000_000,
+  kv_reads: 100_000,      // 100K reads/day
+  kv_writes: 1_000,       // 1K writes/day
+  worker_requests: 100_000, // 100K requests/day
+  r2_class_a: 1_000_000,  // 1M class A ops/month
+  r2_class_b: 10_000_000, // 10M class B ops/month
+  r2_storage_gb: 10,      // 10 GB free
+};
+
+async function checkResourceBudget(env: Env, cid: string): Promise<ResourceBudgetResult> {
+  const result: ResourceBudgetResult = { resources: [], alerts: [], overBudget: false };
+  const db = env.DB;
+
+  try {
+    // 1. Estimate D1 usage from our own action counts
+    const todayStats = await db.prepare(
+      `SELECT warmups, bugs_found, bugs_fixed, workers_checked, hunt_issues FROM daily_stats WHERE date = date('now') LIMIT 1`
+    ).first<any>();
+
+    // Each warmup = ~2-3 D1 ops (read stats + log action), each bug process = ~5 ops
+    const estimatedD1Reads = (todayStats?.warmups || 0) * 3 + (todayStats?.bugs_found || 0) * 2 + (todayStats?.workers_checked || 0) * 2;
+    const estimatedD1Writes = (todayStats?.warmups || 0) + (todayStats?.bugs_fixed || 0) * 3 + (todayStats?.hunt_issues || 0) * 2;
+
+    // 2. Count actual actions logged today (proxy for total D1 writes)
+    const actionCount = await db.prepare(
+      `SELECT COUNT(*) as cnt FROM actions_log WHERE created_at >= datetime('now', '-24 hours')`
+    ).first<{ cnt: number }>();
+    const totalD1Writes = (actionCount?.cnt || 0) * 2; // Each action = insert + possible update
+
+    // 3. Count latency_history rows (heavy D1 consumer)
+    const latencyRows = await db.prepare(
+      `SELECT COUNT(*) as cnt FROM latency_history WHERE recorded_at >= datetime('now', '-24 hours')`
+    ).first<{ cnt: number }>();
+    const latencyD1 = (latencyRows?.cnt || 0) * 2;
+
+    const totalReads = estimatedD1Reads + latencyD1;
+    const totalWrites = totalD1Writes + estimatedD1Writes;
+
+    // D1 Reads
+    const d1ReadPct = (totalReads / CF_FREE_LIMITS.d1_reads) * 100;
+    result.resources.push({
+      type: 'd1_reads',
+      current: totalReads,
+      dailyLimit: CF_FREE_LIMITS.d1_reads,
+      usagePct: d1ReadPct,
+      alertLevel: d1ReadPct > 80 ? 'critical' : d1ReadPct > 50 ? 'warning' : 'ok',
+      details: `~${totalReads.toLocaleString()} estimated reads today`,
+    });
+
+    // D1 Writes
+    const d1WritePct = (totalWrites / CF_FREE_LIMITS.d1_writes) * 100;
+    result.resources.push({
+      type: 'd1_writes',
+      current: totalWrites,
+      dailyLimit: CF_FREE_LIMITS.d1_writes,
+      usagePct: d1WritePct,
+      alertLevel: d1WritePct > 80 ? 'critical' : d1WritePct > 50 ? 'warning' : 'ok',
+      details: `~${totalWrites.toLocaleString()} estimated writes today`,
+    });
+
+    // Worker requests (count total warmup pings as proxy)
+    const workerRequests = (todayStats?.warmups || 0) * 49; // 49 workers per warmup cycle
+    const reqPct = (workerRequests / CF_FREE_LIMITS.worker_requests) * 100;
+    result.resources.push({
+      type: 'worker_requests',
+      current: workerRequests,
+      dailyLimit: CF_FREE_LIMITS.worker_requests,
+      usagePct: reqPct,
+      alertLevel: reqPct > 80 ? 'critical' : reqPct > 50 ? 'warning' : 'ok',
+      details: `~${workerRequests.toLocaleString()} total warmup requests (builder only)`,
+    });
+
+    // KV Reads (cache lookups)
+    const kvReads = (todayStats?.warmups || 0) * 5; // ~5 KV reads per warmup cycle (cron dedup, etc)
+    const kvReadPct = (kvReads / CF_FREE_LIMITS.kv_reads) * 100;
+    result.resources.push({
+      type: 'kv_reads',
+      current: kvReads,
+      dailyLimit: CF_FREE_LIMITS.kv_reads,
+      usagePct: kvReadPct,
+      alertLevel: kvReadPct > 80 ? 'critical' : kvReadPct > 50 ? 'warning' : 'ok',
+      details: `~${kvReads.toLocaleString()} KV reads today`,
+    });
+
+    // Generate alerts for any resource over 50%
+    for (const r of result.resources) {
+      if (r.alertLevel === 'critical') {
+        result.alerts.push(`CRITICAL: ${r.type} at ${r.usagePct.toFixed(1)}% of daily limit (${r.current.toLocaleString()}/${r.dailyLimit.toLocaleString()})`);
+        result.overBudget = true;
+      } else if (r.alertLevel === 'warning') {
+        result.alerts.push(`WARNING: ${r.type} at ${r.usagePct.toFixed(1)}% of daily limit`);
+      }
+    }
+
+    // Log to D1
+    for (const r of result.resources) {
+      await db.prepare(
+        `INSERT INTO resource_budget (cycle_id, resource_type, current_usage, daily_limit, usage_pct, alert_level, details) VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).bind(cid, r.type, r.current, r.dailyLimit, r.usagePct, r.alertLevel, r.details).run().catch(() => {});
+    }
+
+    // Alert to Shared Brain if over budget
+    if (result.overBudget) {
+      try {
+        await env.SVC_BRAIN.fetch('https://echo-shared-brain.bmcii1976.workers.dev/ingest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            instance_id: 'autonomous_builder',
+            role: 'assistant',
+            content: `RESOURCE BUDGET ALERT: ${result.alerts.join('. ')}`,
+            importance: 9,
+            tags: ['alert', 'resource_budget', 'cost'],
+          }),
+        });
+      } catch {}
+    }
+
+    await logAction(db, {
+      action_type: 'resource_budget_check',
+      target: 'cloudflare_free_tier',
+      details: `Checked ${result.resources.length} resource types. ${result.alerts.length} alerts. ${result.overBudget ? 'OVER BUDGET' : 'Within limits.'}`,
+      result: result.overBudget ? 'alert' : 'ok',
+      duration_ms: 0,
+      cycle_id: cid,
+    });
+
+  } catch (err: any) {
+    await logAction(db, {
+      action_type: 'resource_budget_check',
+      target: 'cloudflare_free_tier',
+      details: `Error: ${err.message}`,
+      result: 'error',
+      duration_ms: 0,
+      cycle_id: cid,
+    });
+  }
+
+  return result;
+}
+
+// ═══════════════════════════════════════════════════
 // CRON DISPATCH
 // ═══════════════════════════════════════════════════
 
@@ -7349,8 +7536,9 @@ async function handleCron(event: ScheduledEvent, env: Env, ctx: ExecutionContext
       const deployRegress4h = await detectDeployRegressions(env, cid);
       const endpointCatalog = await catalogWorkerEndpoints(env, cid);
       const errorCorrelation = await detectErrorCorrelations(env, cid);
+      const resourceBudget = await checkResourceBudget(env, cid);
 
-      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations | Contracts: ${contractTests.passed}/${contractTests.total} passed | Revenue: ${revenueReport.revenueReadyCount}/${revenueReport.productsChecked} ready, $${revenueReport.potentialMRR} potential MRR, ${revenueReport.subscriptions.activeTrials} trials, ${revenueReport.subscriptions.activePaid} paid | DoctrineGOLD: ${doctrineAudit.goldPct}% sample, ${doctrineAudit.forgeTriggered} re-forged | Security: ${securityAudit.scanned} scanned, ${securityAudit.findings.length} findings (${securityAudit.findings.filter(f => f.severity === 'critical').length} critical) | Topology: ${topology.workers} workers, ${topology.edges} edges, ${topology.circularDeps.length} circular, ${topology.criticalNodes[0]?.worker || 'none'} top dependency | DeployRegress: ${deployRegress4h.regressions.length}/${deployRegress4h.checked} regressions | EndpointCatalog: ${endpointCatalog.discovered} endpoints from ${endpointCatalog.scanned} workers | ErrorCorrelation: ${errorCorrelation.incidents} new incidents from ${errorCorrelation.analyzed} failures`;
+      const summary = `4-HOUR AUDIT: ${warmResults.length} workers warmed (${warmResults.filter(r => r.healthy).length} healthy) | Hunt: ${huntResult.issuesFound} issues found | ${upgrades.length} upgrade opportunities | Fixes: ${fixResult.fixed}/${fixResult.attempted} | Evolution: ${evoScan.scanned} scanned, ${evoScan.findings} findings | Sandbox: ${sandboxResult.passed}/${sandboxResult.tested} passed | Projects: ${projectResult.created} proposed | EvoFixes: ${evoFixResult.fixed}/${evoFixResult.attempted} | Diagnostics: ${diagResult.result || 'unknown'} | DiagBridge: ${diagBridge.resolved}/${diagBridge.checked} resolved | Latency: ${latencyCheck.analyzed} analyzed, ${latencyCheck.degraded.length} degraded | Deps: ${depAudit.scanned} scanned, ${depAudit.outdated} outdated | Trends: ${trendReport.degrading.length} degrading, ${trendReport.improving.length} improving | VersionDrift: ${versionDrift.driftScore}% (${Object.keys(versionDrift.groups).length} versions) | InfraAnomaly: ${infraAnomaly.classification} (${infraAnomaly.degradedPct}%) | SLA: ${slaCompliance.compliant}/${slaCompliance.checked} compliant, ${slaCompliance.violations.length} violations | Contracts: ${contractTests.passed}/${contractTests.total} passed | Revenue: ${revenueReport.revenueReadyCount}/${revenueReport.productsChecked} ready, $${revenueReport.potentialMRR} potential MRR, ${revenueReport.subscriptions.activeTrials} trials, ${revenueReport.subscriptions.activePaid} paid | DoctrineGOLD: ${doctrineAudit.goldPct}% sample, ${doctrineAudit.forgeTriggered} re-forged | Security: ${securityAudit.scanned} scanned, ${securityAudit.findings.length} findings (${securityAudit.findings.filter(f => f.severity === 'critical').length} critical) | Topology: ${topology.workers} workers, ${topology.edges} edges, ${topology.circularDeps.length} circular, ${topology.criticalNodes[0]?.worker || 'none'} top dependency | DeployRegress: ${deployRegress4h.regressions.length}/${deployRegress4h.checked} regressions | EndpointCatalog: ${endpointCatalog.discovered} endpoints from ${endpointCatalog.scanned} workers | ErrorCorrelation: ${errorCorrelation.incidents} new incidents from ${errorCorrelation.analyzed} failures | ResourceBudget: ${resourceBudget.alerts.length} alerts, ${resourceBudget.overBudget ? 'OVER BUDGET' : 'within limits'}`;
 
       await logAction(env.DB, {
         action_type: 'cycle_4hour',
@@ -7461,6 +7649,7 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         topology: '/topology',
         topologyImpact: '/topology/impact/:worker',
         errorCorrelations: '/error-correlations',
+        resourceBudget: '/resource-budget',
       }
     }), { headers: corsHeaders });
   }
@@ -7560,7 +7749,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
         'sla_compliance_monitoring', 'latency_percentile_dashboard',
         'api_contract_testing',
         'fleet_topology_mapping', 'circular_dependency_detection', 'impact_analysis',
-        'cross_worker_error_correlation', 'incident_pattern_detection'
+        'cross_worker_error_correlation', 'incident_pattern_detection',
+        'resource_budget_monitoring', 'free_tier_usage_tracking'
       ]
     }), { headers: corsHeaders });
   }
@@ -8404,6 +8594,54 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
   if (path === '/error-correlations' && request.method === 'POST') {
     const cid = cycleId();
     const result = await detectErrorCorrelations(env, cid);
+    return new Response(JSON.stringify({ ...result, timestamp: new Date().toISOString() }), { headers: corsHeaders });
+  }
+
+  // ─── GET /resource-budget ───
+  if (path === '/resource-budget' && request.method === 'GET') {
+    const limit = parseInt(url.searchParams.get('limit') || '50');
+    const latest = await env.DB.prepare(
+      `SELECT * FROM resource_budget ORDER BY created_at DESC LIMIT ?`
+    ).bind(limit).all();
+
+    // Group by cycle_id for latest snapshot
+    const byCycle: Record<string, any[]> = {};
+    for (const row of latest.results || []) {
+      const r = row as any;
+      if (!byCycle[r.cycle_id]) byCycle[r.cycle_id] = [];
+      byCycle[r.cycle_id].push(r);
+    }
+    const cycles = Object.keys(byCycle);
+    const latestCycle = cycles.length > 0 ? byCycle[cycles[0]] : [];
+
+    // Build trend from last 24 snapshots
+    const trend = await env.DB.prepare(
+      `SELECT cycle_id, resource_type, usage_pct, alert_level, created_at FROM resource_budget WHERE resource_type = 'd1_writes' ORDER BY created_at DESC LIMIT 24`
+    ).all();
+
+    return new Response(JSON.stringify({
+      current: latestCycle.map((r: any) => ({
+        type: r.resource_type,
+        current: r.current_usage,
+        limit: r.daily_limit,
+        pct: r.usage_pct,
+        alert: r.alert_level,
+        details: r.details,
+      })),
+      trend: (trend.results || []).map((r: any) => ({
+        type: r.resource_type,
+        pct: r.usage_pct,
+        alert: r.alert_level,
+        time: r.created_at,
+      })),
+      timestamp: new Date().toISOString(),
+    }), { headers: corsHeaders });
+  }
+
+  // ─── POST /resource-budget ───
+  if (path === '/resource-budget' && request.method === 'POST') {
+    const cid = cycleId();
+    const result = await checkResourceBudget(env, cid);
     return new Response(JSON.stringify({ ...result, timestamp: new Date().toISOString() }), { headers: corsHeaders });
   }
 
